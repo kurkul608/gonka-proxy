@@ -268,6 +268,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 				}
 
 				copyHeaders(w.Header(), upstreamResponse.Header)
+				setProviderHeaders(w.Header(), selected)
 				w.WriteHeader(upstreamResponse.StatusCode)
 				_, _ = w.Write(responseBody)
 				return
@@ -278,6 +279,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 			streaming := isStreamingResponse(upstreamResponse, payload)
 			defer upstreamResponse.Body.Close()
 			copyHeaders(w.Header(), upstreamResponse.Header)
+			setProviderHeaders(w.Header(), selected)
 			w.WriteHeader(upstreamResponse.StatusCode)
 			if streaming {
 				s.forwardStreamingResponse(w, r, selected, upstreamResponse.StatusCode, upstreamResponse.Body)
@@ -759,6 +761,14 @@ func applyUpstreamOverrides(payload map[string]json.RawMessage, modelAlias strin
 		delete(forwardedPayload, "reasoning_effort")
 	}
 	return json.Marshal(forwardedPayload)
+}
+
+// setProviderHeaders exposes which upstream actually served the request so
+// clients can attribute usage per provider/model. Set after copyHeaders so an
+// upstream cannot spoof the values with its own headers.
+func setProviderHeaders(destination http.Header, selected *provider) {
+	destination.Set("X-Gonka-Provider", selected.Name)
+	destination.Set("X-Gonka-Model", selected.ModelAlias)
 }
 
 func copyHeaders(destination, source http.Header) {

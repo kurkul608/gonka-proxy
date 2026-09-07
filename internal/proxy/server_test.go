@@ -523,6 +523,74 @@ func TestChatCompletionsPreservesDeclarationOrderForEqualPriority(t *testing.T) 
 	}
 }
 
+func TestChatCompletionsExposesServingProviderHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// An upstream must not be able to spoof the attribution headers.
+		w.Header().Set("X-Gonka-Provider", "spoofed")
+		w.Header().Set("X-Gonka-Model", "spoofed-model")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-attribution","object":"chat.completion"}`)
+	}))
+	defer upstream.Close()
+
+	server := newProxyServer(t, []providerFixture{
+		{name: "serving-provider", baseURL: upstream.URL + "/v1", apiKey: "secret", modelAlias: "served-model", priority: 100},
+	})
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if got := resp.Header.Get("X-Gonka-Provider"); got != "serving-provider" {
+		t.Fatalf("X-Gonka-Provider = %q, want serving-provider", got)
+	}
+	if got := resp.Header.Get("X-Gonka-Model"); got != "served-model" {
+		t.Fatalf("X-Gonka-Model = %q, want served-model", got)
+	}
+}
+
+func TestChatCompletionsFailoverExposesServingProviderHeaders(t *testing.T) {
+	rateLimited := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":"rate limited"}`)
+	}))
+	defer rateLimited.Close()
+
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"backup"}`)
+	}))
+	defer backup.Close()
+
+	server := newProxyServer(t, []providerFixture{
+		{name: "primary", baseURL: rateLimited.URL + "/v1", apiKey: "primary-secret", modelAlias: "primary-model", priority: 100},
+		{name: "backup", baseURL: backup.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+	})
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if got := resp.Header.Get("X-Gonka-Provider"); got != "backup" {
+		t.Fatalf("X-Gonka-Provider = %q, want backup (the provider that served after failover)", got)
+	}
+	if got := resp.Header.Get("X-Gonka-Model"); got != "backup-model" {
+		t.Fatalf("X-Gonka-Model = %q, want backup-model", got)
+	}
+}
+
 func TestChatCompletionsFailsOverOnRateLimit(t *testing.T) {
 	var rateLimitedHits atomic.Int32
 	var backupHits atomic.Int32
