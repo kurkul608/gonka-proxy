@@ -626,6 +626,11 @@ func TestChatCompletionsFailsOverOnUnsupportedReasoningEffort(t *testing.T) {
 	}{
 		{name: "nested_error_message", body: `{"error":{"message":"reasoning_effort: unsupported value: max","type":"invalid_request_error"}}`},
 		{name: "top_level_message", body: `{"message":"reasoning_effort: unsupported value: xhigh"}`},
+		{name: "top_level_message_with_extras", body: `{"message":"reasoning_effort: unsupported value: got \"max\"","type":"invalid_request_error","code":"bad_request","request_id":"1306c21e-6d21-446f-8145-396949345b79"}`},
+		{name: "bom_prefixed_body", body: "\xef\xbb\xbf" + `{"message":"reasoning_effort: unsupported value: max"}`},
+		{name: "trailing_garbage_body", body: `{"message":"reasoning_effort: unsupported value: max"}` + " trailing-garbage"},
+		{name: "errors_array_envelope", body: `{"errors":[{"message":"reasoning_effort: unsupported value: max"}]}`},
+		{name: "error_detail_only", body: `{"error":{"code":"bad_request","detail":"reasoning_effort: unsupported value: max"}}`},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			var primaryHits atomic.Int32

@@ -262,7 +262,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 				}
 				s.logProviderResponse(selected, upstreamResponse.StatusCode, errorMessage)
 
-				if isReasoningEffortUnsupportedError(upstreamResponse.StatusCode, errorMessage) {
+				if isReasoningEffortUnsupportedError(upstreamResponse.StatusCode, errorMessage, responseBody) {
 					s.handleFailoverFailure(selected, "reasoning-effort", upstreamResponse.StatusCode)
 					continue
 				}
@@ -702,12 +702,22 @@ func isFailoverStatus(statusCode int) bool {
 // body like {"error":{"message":"reasoning_effort: unsupported value: ..."}},
 // which is a request-shaping problem the proxy can fix by failing over to a
 // provider that accepts the configured value.
-func isReasoningEffortUnsupportedError(statusCode int, errorMessage string) bool {
+//
+// Both the extracted message and the raw body are scanned: extraction fails on
+// bodies the JSON parser rejects (BOM prefix, trailing garbage, unfamiliar
+// envelopes), while the distinctive substrings survive verbatim in the raw
+// bytes the client ends up seeing.
+func isReasoningEffortUnsupportedError(statusCode int, errorMessage string, responseBody []byte) bool {
 	if statusCode != http.StatusBadRequest {
 		return false
 	}
-	message := strings.ToLower(errorMessage)
-	return strings.Contains(message, "reasoning_effort") && strings.Contains(message, "unsupported value")
+	return containsUnsupportedReasoningEffort(errorMessage) ||
+		containsUnsupportedReasoningEffort(string(responseBody))
+}
+
+func containsUnsupportedReasoningEffort(message string) bool {
+	lowered := strings.ToLower(message)
+	return strings.Contains(lowered, "reasoning_effort") && strings.Contains(lowered, "unsupported value")
 }
 
 func chatCompletionsURL(baseURL string) (string, error) {
