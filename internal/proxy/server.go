@@ -10,15 +10,28 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/glaicer/gonka-proxy/internal/auth"
 	"github.com/glaicer/gonka-proxy/internal/config"
 )
 
-const chatCompletionsPath = "/v1/chat/completions"
+const (
+	chatCompletionsPath = "/v1/chat/completions"
+	modelsPath          = "/v1/models"
+
+	// MaxRoutingTimeHeader lets a client shorten the Max Routing Time for one
+	// request (capped by max_routing_time when that is configured).
+	MaxRoutingTimeHeader = "X-Gonka-Max-Routing-Time"
+	// ProviderHeader and ModelHeader name the Provider and upstream model that
+	// served a response.
+	ProviderHeader = "X-Gonka-Provider"
+	ModelHeader    = "X-Gonka-Model"
+)
 
 const (
 	maxLoggedErrorMessageLength = 512
@@ -38,85 +51,107 @@ type Logger interface {
 	Printf(format string, args ...any)
 }
 
-// Server implements the public OpenAI-compatible HTTP endpoint.
-type Server struct {
-	providers        []*provider
-	client           *http.Client
-	cooldownDuration time.Duration
-	recoveryWait     time.Duration
-	cooldownMu       sync.Mutex
-	cooldownVersion  uint64
-	logger           Logger
-	logLevel         config.LogLevel
-	failoverOn404    bool
+// Options are process-level settings that do not belong to the hot-reloadable
+// configuration.
+type Options struct {
+	Logger Logger
+	// ClientToken, when set, is the bearer token every /v1/* request must carry.
+	ClientToken string
 }
 
-type provider struct {
-	config.Provider
-	chatURL         string
-	cooldownUntil   time.Time
-	cooldownVersion uint64
-
-	// reasoningEffort is the effective effort for this provider: the provider
-	// override, or the global value when unset. Nil strips the field.
-	reasoningEffort *config.ReasoningEffort
+// Server implements the public OpenAI-compatible HTTP endpoint. Its routing
+// configuration can be replaced at runtime with Reload.
+type Server struct {
+	state       atomic.Pointer[snapshot]
+	cooldowns   *cooldownRegistry
+	logger      Logger
+	clientToken string
+	reloadMu    sync.Mutex
 }
 
 // New creates a proxy handler from validated configuration.
 func New(cfg config.Config) (*Server, error) {
-	return NewWithLogger(cfg, log.Default())
+	return NewWithOptions(cfg, Options{Logger: log.Default()})
 }
 
 // NewWithLogger creates a proxy handler with an injected operational logger.
 func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
-	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid proxy config: %w", err)
-	}
+	return NewWithOptions(cfg, Options{Logger: logger})
+}
+
+// NewWithOptions creates a proxy handler with process-level options.
+func NewWithOptions(cfg config.Config, options Options) (*Server, error) {
+	logger := options.Logger
 	if logger == nil {
 		logger = log.Default()
 	}
-	logLevel := cfg.LogLevel
-	if logLevel == "" {
-		logLevel = config.LogLevelWarn
+	st, err := buildSnapshot(cfg, logger, nil)
+	if err != nil {
+		return nil, err
 	}
+	s := &Server{
+		cooldowns:   newCooldownRegistry(),
+		logger:      logger,
+		clientToken: strings.TrimSpace(options.ClientToken),
+	}
+	s.state.Store(st)
+	return s, nil
+}
 
-	// Normalize programmatic Config values (e.g. "MAX") to lower; Load already normalizes.
-	normalizedEffort := normalizeReasoningEffort(cfg.ReasoningEffort)
+// ReloadResult describes the configuration in force after a Reload.
+type ReloadResult struct {
+	Version  string
+	Changed  bool
+	LoadedAt time.Time
+}
 
-	providers := make([]*provider, 0, len(cfg.Providers))
-	for _, configuredProvider := range cfg.Providers {
-		chatURL, err := chatCompletionsURL(configuredProvider.BaseURL)
-		if err != nil {
-			return nil, fmt.Errorf("Provider base URL: %w", err)
+// Reload validates cfg and atomically replaces the routing configuration.
+// Requests already in flight finish on the configuration they started with;
+// new requests use cfg. Cooldowns of Providers whose name, base URL and API
+// key are unchanged (and of upstream models they still serve) are kept.
+//
+// beforeSwap, when not nil, runs after validation and before the swap (for
+// example to persist cfg); an error from it aborts the reload.
+func (s *Server) Reload(cfg config.Config, beforeSwap func(config.Config) error) (ReloadResult, error) {
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+
+	current := s.state.Load()
+	next, err := buildSnapshot(cfg, s.logger, current)
+	if err != nil {
+		return ReloadResult{}, err
+	}
+	if beforeSwap != nil {
+		if err := beforeSwap(cfg); err != nil {
+			return ReloadResult{}, err
 		}
-		providers = append(providers, &provider{
-			Provider:        configuredProvider,
-			chatURL:         chatURL,
-			reasoningEffort: resolveReasoningEffort(normalizedEffort, configuredProvider),
-		})
 	}
-	sort.SliceStable(providers, func(i, j int) bool {
-		return providers[i].Priority > providers[j].Priority
-	})
-
-	transport, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		return nil, fmt.Errorf("http.DefaultTransport is not an *http.Transport")
+	if next.version == current.version {
+		return ReloadResult{Version: current.version, Changed: false, LoadedAt: current.loadedAt}, nil
 	}
-	transport = transport.Clone()
-	transport.ResponseHeaderTimeout = cfg.ResponseHeaderTimeout
+	if cfg.ListenAddress != current.cfg.ListenAddress {
+		s.logger.Printf("config reload - server.listen_address change takes effect after a restart")
+	}
+	s.state.Store(next)
+	s.cooldowns.retain(next.servesKey)
+	if next.transport != current.transport {
+		current.transport.CloseIdleConnections()
+	}
+	s.logger.Printf("config reloaded - version=%s providers=%d enabled=%d", shortVersion(next.version), len(next.providers), next.enabledCount)
+	return ReloadResult{Version: next.version, Changed: true, LoadedAt: next.loadedAt}, nil
+}
 
-	return &Server{
-		providers:        providers,
-		cooldownDuration: cfg.Cooldown,
-		recoveryWait:     cfg.RecoveryWait,
-		client: &http.Client{
-			Transport: transport,
-		},
-		logger:        logger,
-		logLevel:      logLevel,
-		failoverOn404: cfg.FailoverOn404,
-	}, nil
+func shortVersion(version string) string {
+	if len(version) > 12 {
+		return version[:12]
+	}
+	return version
+}
+
+// Current returns the configuration in force, its version and load time.
+func (s *Server) Current() (config.Config, string, time.Time) {
+	st := s.state.Load()
+	return st.cfg, st.version, st.loadedAt
 }
 
 // normalizeReasoningEffort normalizes an effort pointer so programmatic
@@ -129,233 +164,376 @@ func normalizeReasoningEffort(effort *config.ReasoningEffort) *config.ReasoningE
 	return &n
 }
 
-// resolveReasoningEffort picks the effective effort for a provider: an
-// explicit strip wins, then the provider override, then the global value.
-func resolveReasoningEffort(global *config.ReasoningEffort, p config.Provider) *config.ReasoningEffort {
-	if p.StripReasoningEffort {
-		return nil
+// ServeHTTP handles chat completions and the model list used by client discovery.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.clientToken != "" && strings.HasPrefix(r.URL.Path, "/v1/") &&
+		!auth.BearerMatches(r.Header.Get("Authorization"), s.clientToken) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="gonka-proxy"`)
+		WriteError(w, http.StatusUnauthorized, ErrorTypeInvalidRequest, CodeInvalidAPIKey, "missing or invalid client token")
+		return
 	}
-	if override := normalizeReasoningEffort(p.ReasoningEffort); override != nil {
-		return override
+
+	st := s.state.Load()
+	switch r.URL.Path {
+	case modelsPath:
+		serveModels(st, w, r)
+	case chatCompletionsPath:
+		s.serveChat(st, w, r)
+	default:
+		http.NotFound(w, r)
 	}
-	return global
 }
 
-// ServeHTTP handles the single MVP endpoint.
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != chatCompletionsPath {
-		http.NotFound(w, r)
+type modelEntry struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	OwnedBy string `json:"owned_by"`
+}
+
+// serveModels lists the configured Virtual Models (or, with only legacy
+// Providers, each Model Alias once in priority order) so OpenAI-compatible
+// clients can discover and test the endpoint.
+func serveModels(st *snapshot, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
 		return
 	}
+	ids := st.listedModels()
+	models := make([]modelEntry, 0, len(ids))
+	for _, id := range ids {
+		models = append(models, modelEntry{ID: id, Object: "model", OwnedBy: "gonka-proxy"})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		Object string       `json:"object"`
+		Data   []modelEntry `json:"data"`
+	}{Object: "list", Data: models})
+}
+
+// chatRequest is one client request bound to the snapshot it started on.
+type chatRequest struct {
+	st           *snapshot
+	r            *http.Request
+	payload      map[string]json.RawMessage
+	virtual      string
+	routes       []route
+	clientEffort *config.ReasoningEffort
+	deadline     *routingDeadline
+	limit        time.Duration
+}
+
+func (s *Server) serveChat(st *snapshot, w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeMethodNotAllowed(w, http.MethodPost)
 		return
 	}
-	if len(s.providers) == 0 {
-		http.Error(w, "no Providers configured", http.StatusServiceUnavailable)
+	if st.enabledCount == 0 {
+		WriteError(w, http.StatusServiceUnavailable, ErrorTypeServer, CodeNoProviderAvailable, "no Providers configured")
 		return
 	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		if r.Context().Err() != nil {
-			s.logCancellation("request-body")
+			st.logCancellation("request-body")
 			return
 		}
-		http.Error(w, "could not read request body", http.StatusBadRequest)
+		WriteError(w, http.StatusBadRequest, ErrorTypeInvalidRequest, CodeInvalidRequestBody, "could not read request body")
 		return
 	}
 	defer r.Body.Close()
 
 	payload, err := decodeRequestBody(body)
 	if err != nil {
-		http.Error(w, "request body must be a JSON object", http.StatusBadRequest)
+		WriteError(w, http.StatusBadRequest, ErrorTypeInvalidRequest, CodeInvalidRequestBody, "request body must be a JSON object")
 		return
 	}
 
-	s.route(w, r, payload)
+	virtual := requestedModel(payload)
+	routes := st.routes(virtual)
+	if len(routes) == 0 {
+		if !st.knows(virtual) {
+			writeErrorParam(w, http.StatusNotFound, ErrorTypeInvalidRequest, CodeModelNotFound, "model",
+				fmt.Sprintf("The model `%s` does not exist or is not served by this proxy.", virtual))
+			return
+		}
+		WriteError(w, http.StatusServiceUnavailable, ErrorTypeServer, CodeNoProviderAvailable,
+			fmt.Sprintf("no enabled Provider serves the model `%s`", virtual))
+		return
+	}
+
+	var clientEffort *config.ReasoningEffort
+	if st.clientEffortAllowed(virtual) {
+		clientEffort, err = clientReasoningEffort(payload)
+		if err != nil {
+			writeErrorParam(w, http.StatusBadRequest, ErrorTypeInvalidRequest, CodeInvalidReasoningEffort, "reasoning_effort", err.Error())
+			return
+		}
+	}
+
+	limit, err := routingLimit(st.maxRoutingTime, r.Header.Get(MaxRoutingTimeHeader))
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, ErrorTypeInvalidRequest, CodeInvalidMaxRoutingTime, err.Error())
+		return
+	}
+	deadline := newRoutingDeadline(limit)
+	defer deadline.stop()
+
+	s.route(w, &chatRequest{
+		st:           st,
+		r:            r,
+		payload:      payload,
+		virtual:      virtual,
+		routes:       routes,
+		clientEffort: clientEffort,
+		deadline:     deadline,
+		limit:        limit,
+	})
 }
 
-func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[string]json.RawMessage) {
+// requestedModel returns the client's Virtual Model, or "" when absent.
+func requestedModel(payload map[string]json.RawMessage) string {
+	var model string
+	if raw, ok := payload["model"]; ok && json.Unmarshal(raw, &model) == nil {
+		return strings.TrimSpace(model)
+	}
+	return ""
+}
+
+// clientReasoningEffort reads an allowed client-supplied reasoning_effort.
+// Absent or JSON null means "not supplied".
+func clientReasoningEffort(payload map[string]json.RawMessage) (*config.ReasoningEffort, error) {
+	raw, ok := payload["reasoning_effort"]
+	if !ok || string(bytes.TrimSpace(raw)) == "null" {
+		return nil, nil
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, errors.New(config.ReasoningEffortErrorMessage)
+	}
+	effort, err := config.ParseReasoningEffort(value)
+	if err != nil {
+		return nil, errors.New(config.ReasoningEffortErrorMessage)
+	}
+	return effort, nil
+}
+
+// routingLimit combines max_routing_time with the optional per-request
+// header. The header may only shorten a configured limit. A bare number is
+// read as seconds.
+func routingLimit(configured time.Duration, header string) (time.Duration, error) {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return configured, nil
+	}
+	requested, err := time.ParseDuration(header)
+	if err != nil {
+		seconds, numberErr := strconv.ParseFloat(header, 64)
+		if numberErr != nil {
+			return 0, fmt.Errorf("%s must be a duration such as 10s", MaxRoutingTimeHeader)
+		}
+		requested = time.Duration(seconds * float64(time.Second))
+	}
+	if requested <= 0 {
+		return 0, fmt.Errorf("%s must be greater than zero", MaxRoutingTimeHeader)
+	}
+	if configured > 0 && requested > configured {
+		return configured, nil
+	}
+	return requested, nil
+}
+
+func (s *Server) route(w http.ResponseWriter, req *chatRequest) {
+	st := req.st
 	for {
-		if r.Context().Err() != nil {
-			s.logCancellation("routing")
+		if req.r.Context().Err() != nil {
+			st.logCancellation("routing")
 			return
 		}
 
-		for _, selected := range s.providers {
-			if r.Context().Err() != nil {
-				s.logCancellation("routing")
+		for _, candidate := range req.routes {
+			if req.r.Context().Err() != nil {
+				st.logCancellation("routing")
 				return
 			}
-
-			if !s.providerAvailable(selected, time.Now()) {
+			if req.deadline.isExpired() {
+				writeRoutingTimeout(st, w, req.limit)
+				return
+			}
+			if !s.cooldowns.available(candidate.provider.id, candidate.upstream, time.Now()) {
 				continue
 			}
-			s.logAt(config.LogLevelInfo, "provider selected - %s - priority=%d", s.redactProviderSecrets(selected.Name), selected.Priority)
-
-			upstreamBody, err := applyUpstreamOverrides(payload, selected.ModelAlias, selected.reasoningEffort)
-			if err != nil {
-				http.Error(w, "could not encode upstream request", http.StatusBadGateway)
+			st.logAt(config.LogLevelInfo, "provider selected - %s - priority=%d", st.redactProviderSecrets(candidate.provider.Name), candidate.provider.Priority)
+			if s.attempt(w, req, candidate) {
 				return
 			}
-
-			upstreamRequest, err := http.NewRequestWithContext(
-				r.Context(),
-				http.MethodPost,
-				selected.chatURL,
-				bytes.NewReader(upstreamBody),
-			)
-			if err != nil {
-				http.Error(w, "could not create upstream request", http.StatusBadGateway)
-				return
-			}
-			copyHeaders(upstreamRequest.Header, r.Header)
-			upstreamRequest.Header.Set("Authorization", "Bearer "+selected.APIKey)
-
-			upstreamResponse, err := s.client.Do(upstreamRequest)
-			if err != nil {
-				if r.Context().Err() != nil {
-					s.logCancellation("upstream")
-					return
-				}
-				s.logProviderResponse(selected, 0, err.Error())
-				category := "network"
-				if isResponseHeaderTimeout(err) {
-					category = "response-header-timeout"
-				}
-				s.handleFailoverFailure(selected, category, 0)
-				continue
-			}
-
-			if upstreamResponse.StatusCode != http.StatusOK {
-				if isFailoverStatus(upstreamResponse.StatusCode) || (s.failoverOn404 && upstreamResponse.StatusCode == http.StatusNotFound) {
-					var errorMessage string
-					if s.payloadLoggingEnabled() {
-						responseBody, readErr := readErrorBodyForLog(upstreamResponse.Body)
-						if readErr == nil && len(responseBody) > 0 {
-							errorMessage = errorMessageFromResponse(responseBody, upstreamResponse.StatusCode)
-						}
-					} else {
-						_ = upstreamResponse.Body.Close()
-					}
-					_ = upstreamResponse.Body.Close()
-					s.logProviderResponse(selected, upstreamResponse.StatusCode, errorMessage)
-
-					category := "server-error"
-					switch upstreamResponse.StatusCode {
-					case http.StatusPaymentRequired:
-						category = "payment-required"
-					case http.StatusTooManyRequests:
-						category = "rate-limit"
-					case http.StatusNotFound:
-						category = "not-found"
-					}
-					s.handleFailoverFailure(selected, category, upstreamResponse.StatusCode)
-					continue
-				}
-
-				responseBody, readErr := io.ReadAll(upstreamResponse.Body)
-				_ = upstreamResponse.Body.Close()
-				errorMessage := ""
-				if readErr != nil {
-					errorMessage = fmt.Sprintf("read upstream error response: %v", readErr)
-				} else if len(responseBody) > 0 {
-					errorMessage = errorMessageFromResponse(responseBody, upstreamResponse.StatusCode)
-				}
-				s.logProviderResponse(selected, upstreamResponse.StatusCode, errorMessage)
-
-				if isReasoningEffortUnsupportedError(upstreamResponse.StatusCode, errorMessage, responseBody) {
-					s.handleFailoverFailure(selected, "reasoning-effort", upstreamResponse.StatusCode)
-					continue
-				}
-
-				copyHeaders(w.Header(), upstreamResponse.Header)
-				setProviderHeaders(w.Header(), selected)
-				w.WriteHeader(upstreamResponse.StatusCode)
-				_, _ = w.Write(responseBody)
-				return
-			}
-
-			s.logProviderResponse(selected, upstreamResponse.StatusCode, "")
-
-			streaming := isStreamingResponse(upstreamResponse, payload)
-			defer upstreamResponse.Body.Close()
-			copyHeaders(w.Header(), upstreamResponse.Header)
-			setProviderHeaders(w.Header(), selected)
-			w.WriteHeader(upstreamResponse.StatusCode)
-			if streaming {
-				s.forwardStreamingResponse(w, r, selected, upstreamResponse.StatusCode, upstreamResponse.Body)
-				return
-			}
-			_, _ = io.Copy(w, upstreamResponse.Body)
-			return
 		}
 
-		if !s.waitForRecovery(r.Context()) {
+		if !s.waitForRecovery(req) {
+			if req.deadline.isExpired() && req.r.Context().Err() == nil {
+				writeRoutingTimeout(st, w, req.limit)
+			}
 			return
 		}
 	}
 }
 
-func (s *Server) waitForRecovery(ctx context.Context) bool {
-	cooldownVersions := s.snapshotCooldownVersions()
-	s.logAt(config.LogLevelInfo, "recovery wait - started - %s", s.recoveryWait)
-	timer := time.NewTimer(s.recoveryWait)
-	defer func() {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
+// attempt sends the request to one Provider. It returns true when the
+// request is finished (response written, client gone, or routing time
+// exceeded) and false when routing should continue with the next Provider.
+func (s *Server) attempt(w http.ResponseWriter, req *chatRequest, candidate route) bool {
+	st := req.st
+	r := req.r
+	selected := candidate.provider
+
+	upstreamBody, err := applyUpstreamOverrides(req.payload, candidate.upstream, st.resolveEffort(selected, req.virtual, req.clientEffort))
+	if err != nil {
+		WriteError(w, http.StatusBadGateway, ErrorTypeServer, CodeUpstreamRequestFailed, "could not encode upstream request")
+		return true
+	}
+
+	attemptContext, cancelAttempt := context.WithCancel(r.Context())
+	defer cancelAttempt()
+	req.deadline.arm(cancelAttempt)
+
+	upstreamRequest, err := http.NewRequestWithContext(attemptContext, http.MethodPost, selected.chatURL, bytes.NewReader(upstreamBody))
+	if err != nil {
+		WriteError(w, http.StatusBadGateway, ErrorTypeServer, CodeUpstreamRequestFailed, "could not create upstream request")
+		return true
+	}
+	copyHeaders(upstreamRequest.Header, r.Header)
+	upstreamRequest.Header.Del(MaxRoutingTimeHeader)
+	upstreamRequest.Header.Set("Authorization", "Bearer "+selected.APIKey)
+
+	upstreamResponse, err := st.client.Do(upstreamRequest)
+	if err != nil {
+		if r.Context().Err() != nil {
+			st.logCancellation("upstream")
+			return true
 		}
-	}()
+		if req.deadline.isExpired() {
+			writeRoutingTimeout(st, w, req.limit)
+			return true
+		}
+		s.logProviderResponse(st, selected, 0, err.Error())
+		kind, category := failureKindNetwork, "network"
+		if isResponseHeaderTimeout(err) {
+			kind, category = failureKindTimeout, "response-header-timeout"
+		}
+		s.handleFailoverFailure(st, candidate, kind, category, 0)
+		return false
+	}
+
+	statusCode := upstreamResponse.StatusCode
+	if statusCode != http.StatusOK {
+		authFailure := st.failoverOnAuth && (statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden)
+		if isFailoverStatus(statusCode) || (st.failoverOn404 && statusCode == http.StatusNotFound) || authFailure {
+			var errorMessage string
+			if st.payloadLoggingEnabled() {
+				responseBody, readErr := readErrorBodyForLog(upstreamResponse.Body)
+				if readErr == nil && len(responseBody) > 0 {
+					errorMessage = errorMessageFromResponse(responseBody, statusCode)
+				}
+			}
+			_ = upstreamResponse.Body.Close()
+			s.logProviderResponse(st, selected, statusCode, errorMessage)
+
+			category := "server-error"
+			switch statusCode {
+			case http.StatusPaymentRequired:
+				category = "payment-required"
+			case http.StatusTooManyRequests:
+				category = "rate-limit"
+			case http.StatusNotFound:
+				category = "not-found"
+			case http.StatusUnauthorized, http.StatusForbidden:
+				category = "auth"
+			}
+			s.handleFailoverFailure(st, candidate, failureKindStatus, category, statusCode)
+			return false
+		}
+
+		responseBody, readErr := io.ReadAll(upstreamResponse.Body)
+		_ = upstreamResponse.Body.Close()
+		errorMessage := ""
+		if readErr != nil {
+			errorMessage = fmt.Sprintf("read upstream error response: %v", readErr)
+		} else if len(responseBody) > 0 {
+			errorMessage = errorMessageFromResponse(responseBody, statusCode)
+		}
+		s.logProviderResponse(st, selected, statusCode, errorMessage)
+
+		if isReasoningEffortUnsupportedError(statusCode, errorMessage, responseBody) {
+			s.handleFailoverFailure(st, candidate, failureKindStatus, "reasoning-effort", statusCode)
+			return false
+		}
+		if !req.deadline.commit() {
+			writeRoutingTimeout(st, w, req.limit)
+			return true
+		}
+
+		copyHeaders(w.Header(), upstreamResponse.Header)
+		setProviderHeaders(w.Header(), selected.Name, candidate.upstream)
+		w.WriteHeader(statusCode)
+		_, _ = w.Write(responseBody)
+		return true
+	}
+
+	defer upstreamResponse.Body.Close()
+	if !req.deadline.commit() {
+		writeRoutingTimeout(st, w, req.limit)
+		return true
+	}
+	s.logProviderResponse(st, selected, statusCode, "")
+
+	streaming := isStreamingResponse(upstreamResponse, req.payload)
+	copyHeaders(w.Header(), upstreamResponse.Header)
+	setProviderHeaders(w.Header(), selected.Name, candidate.upstream)
+	w.WriteHeader(statusCode)
+	if streaming {
+		s.forwardStreamingResponse(w, req, candidate, statusCode, upstreamResponse.Body)
+		return true
+	}
+	_, _ = io.Copy(w, upstreamResponse.Body)
+	return true
+}
+
+func writeRoutingTimeout(st *snapshot, w http.ResponseWriter, limit time.Duration) {
+	st.logAt(config.LogLevelWarn, "routing time exceeded - %s", limit)
+	WriteError(w, http.StatusServiceUnavailable, ErrorTypeServer, CodeNoProviderAvailable,
+		fmt.Sprintf("no Provider answered within the max routing time (%s)", limit))
+}
+
+// waitForRecovery runs one Recovery Wait. It returns false when the client
+// went away or the routing time ran out.
+func (s *Server) waitForRecovery(req *chatRequest) bool {
+	st := req.st
+	ctx := req.r.Context()
+	versions := s.cooldowns.versions()
+	st.logAt(config.LogLevelInfo, "recovery wait - started - %s", st.recoveryWait)
+	timer := time.NewTimer(st.recoveryWait)
+	defer timer.Stop()
 
 	select {
 	case <-ctx.Done():
-		s.logAt(config.LogLevelInfo, "recovery wait - canceled")
+		st.logAt(config.LogLevelInfo, "recovery wait - canceled")
+		return false
+	case <-req.deadline.expiredC():
+		st.logAt(config.LogLevelInfo, "recovery wait - routing time exceeded")
 		return false
 	case <-timer.C:
 		if ctx.Err() != nil {
-			s.logAt(config.LogLevelInfo, "recovery wait - canceled")
+			st.logAt(config.LogLevelInfo, "recovery wait - canceled")
 			return false
 		}
-		cleared := s.clearCooldowns(cooldownVersions)
-		s.logAt(config.LogLevelInfo, "recovery wait - completed - cleared=%d", cleared)
+		cleared := s.cooldowns.clear(versions)
+		for _, key := range cleared {
+			st.logAt(config.LogLevelInfo, "%s - cooldown cleared", st.label(key))
+		}
+		st.logAt(config.LogLevelInfo, "recovery wait - completed - cleared=%d", len(cleared))
 		return true
 	}
-}
-
-func (s *Server) snapshotCooldownVersions() map[*provider]uint64 {
-	s.cooldownMu.Lock()
-	defer s.cooldownMu.Unlock()
-
-	versions := make(map[*provider]uint64, len(s.providers))
-	for _, selected := range s.providers {
-		versions[selected] = selected.cooldownVersion
-	}
-	return versions
-}
-
-func (s *Server) clearCooldowns(versions map[*provider]uint64) int {
-	s.cooldownMu.Lock()
-	cleared := make([]*provider, 0, len(s.providers))
-	for _, selected := range s.providers {
-		if selected.cooldownVersion != versions[selected] {
-			continue
-		}
-		if selected.cooldownUntil.IsZero() {
-			continue
-		}
-		selected.cooldownUntil = time.Time{}
-		cleared = append(cleared, selected)
-	}
-	s.cooldownMu.Unlock()
-	for _, selected := range cleared {
-		s.logAt(config.LogLevelInfo, "%s - cooldown cleared", s.redactProviderSecrets(selected.Name))
-	}
-	return len(cleared)
 }
 
 // dataChunk is a small accumulator used to detect SSE termination markers that
@@ -423,7 +601,8 @@ func isSSEDoneLine(line []byte) bool {
 		bytes.Equal(line, []byte("data: "+sseDoneMarker))
 }
 
-func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request, selected *provider, statusCode int, body io.Reader) {
+func (s *Server) forwardStreamingResponse(w http.ResponseWriter, req *chatRequest, candidate route, statusCode int, body io.Reader) {
+	st := req.st
 	flusher, canFlush := w.(http.Flusher)
 	if canFlush {
 		flusher.Flush()
@@ -432,7 +611,7 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request
 	buffer := make([]byte, 32*1024)
 	var sentBytes int64
 	var chunks int64
-	acc := newDataChunk(s.streamTailLimit())
+	acc := newDataChunk(st.streamTailLimit)
 
 	for {
 		readCount, readErr := body.Read(buffer)
@@ -442,7 +621,7 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request
 			sentBytes += int64(readCount)
 			chunks++
 			if _, writeErr := w.Write(chunk); writeErr != nil {
-				s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
+				recordStreamAbort(st, candidate.provider, statusCode, sentBytes, chunks, acc,
 					fmt.Sprintf("client-write error: %v", writeErr))
 				return
 			}
@@ -458,32 +637,32 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request
 			if acc.sawDone() {
 				return
 			}
-			s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
+			recordStreamAbort(st, candidate.provider, statusCode, sentBytes, chunks, acc,
 				"stream ended at EOF without [DONE] marker (broker SILENTLY cut the response)")
-			s.markCooldown(selected)
+			s.markCooldown(st, candidate, scopeModel, &failureRecord{kind: failureKindStream, category: "stream-incomplete", status: statusCode})
 			return
 		}
-		if r.Context().Err() != nil {
-			s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
+		if req.r.Context().Err() != nil {
+			recordStreamAbort(st, candidate.provider, statusCode, sentBytes, chunks, acc,
 				fmt.Sprintf("upstream read error: %v (request context canceled during stream)", readErr))
 			return
 		}
-		s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
+		recordStreamAbort(st, candidate.provider, statusCode, sentBytes, chunks, acc,
 			fmt.Sprintf("upstream read error: %v", readErr))
-		s.handleFailoverFailure(selected, "stream", statusCode)
+		s.handleFailoverFailure(st, candidate, failureKindStream, "stream", statusCode)
 		return
 	}
 }
 
-func (s *Server) recordStreamAbort(selected *provider, statusCode int, sentBytes, chunks int64, acc *dataChunk, reason string) {
-	providerName := s.redactProviderSecrets(selected.Name)
-	redactedReason := s.redactProviderSecrets(reason)
-	if s.payloadLoggingEnabled() {
-		s.logAt(config.LogLevelInfo, "STREAM-ABORT provider=%s status=%d sent_bytes=%d chunks=%d reason=%s tail=%q",
-			providerName, statusCode, sentBytes, chunks, redactedReason, s.redactedTail(acc))
+func recordStreamAbort(st *snapshot, selected *provider, statusCode int, sentBytes, chunks int64, acc *dataChunk, reason string) {
+	providerName := st.redactProviderSecrets(selected.Name)
+	redactedReason := st.redactProviderSecrets(reason)
+	if st.payloadLoggingEnabled() {
+		st.logAt(config.LogLevelInfo, "STREAM-ABORT provider=%s status=%d sent_bytes=%d chunks=%d reason=%s tail=%q",
+			providerName, statusCode, sentBytes, chunks, redactedReason, redactedTail(st, acc))
 		return
 	}
-	s.logAt(config.LogLevelWarn, "STREAM-ABORT provider=%s status=%d sent_bytes=%d chunks=%d reason=%s",
+	st.logAt(config.LogLevelWarn, "STREAM-ABORT provider=%s status=%d sent_bytes=%d chunks=%d reason=%s",
 		providerName, statusCode, sentBytes, chunks, redactedReason)
 }
 
@@ -494,22 +673,12 @@ func tail(acc *dataChunk) string {
 	return string(acc.buf)
 }
 
-func (s *Server) redactedTail(acc *dataChunk) string {
-	value := s.redactProviderSecrets(tail(acc))
+func redactedTail(st *snapshot, acc *dataChunk) string {
+	value := st.redactProviderSecrets(tail(acc))
 	if len(value) > streamAbortBuf {
 		value = value[len(value)-streamAbortBuf:]
 	}
 	return value
-}
-
-func (s *Server) streamTailLimit() int {
-	maxSecretLength := 0
-	for _, selected := range s.providers {
-		if len(selected.APIKey) > maxSecretLength {
-			maxSecretLength = len(selected.APIKey)
-		}
-	}
-	return streamAbortBuf + maxSecretLength
 }
 
 func isStreamingResponse(response *http.Response, payload map[string]json.RawMessage) bool {
@@ -530,97 +699,54 @@ func isStreamingResponse(response *http.Response, payload map[string]json.RawMes
 	return json.Unmarshal(streamValue, &requested) == nil && requested
 }
 
-func (s *Server) providerAvailable(selected *provider, now time.Time) bool {
-	s.cooldownMu.Lock()
-	defer s.cooldownMu.Unlock()
-	return !now.Before(selected.cooldownUntil)
-}
-
-func (s *Server) markCooldown(selected *provider) {
-	cooldownUntil := time.Now().Add(s.cooldownDuration)
-	s.cooldownMu.Lock()
-	s.cooldownVersion = s.cooldownVersion + 1
-	selected.cooldownVersion = s.cooldownVersion
-	if cooldownUntil.After(selected.cooldownUntil) {
-		selected.cooldownUntil = cooldownUntil
+// markCooldown benches a Provider (scopeProvider) or one of its upstream
+// models (scopeModel) for the configured Cooldown.
+func (s *Server) markCooldown(st *snapshot, candidate route, scope cooldownScope, failure *failureRecord) {
+	key := cooldownKey{provider: candidate.provider.id}
+	if scope == scopeModel {
+		key.model = candidate.upstream
 	}
-	s.cooldownMu.Unlock()
-	s.logAt(config.LogLevelInfo, "%s - cooldown - %s", s.redactProviderSecrets(selected.Name), s.cooldownDuration)
+	if failure != nil {
+		failure.scope = scope
+	}
+	s.cooldowns.mark(key, st.cooldownDuration, failure)
+	st.logAt(config.LogLevelInfo, "%s - cooldown - %s", st.label(key), st.cooldownDuration)
 }
 
-func (s *Server) handleFailoverFailure(selected *provider, category string, statusCode int) {
+func (s *Server) handleFailoverFailure(st *snapshot, candidate route, kind, category string, statusCode int) {
+	name := st.redactProviderSecrets(candidate.provider.Name)
 	if statusCode > 0 {
-		s.logAt(config.LogLevelWarn, "%s - failover - %s - %d", s.redactProviderSecrets(selected.Name), category, statusCode)
+		st.logAt(config.LogLevelWarn, "%s - failover - %s - %d", name, category, statusCode)
 	} else {
-		s.logAt(config.LogLevelWarn, "%s - failover - %s", s.redactProviderSecrets(selected.Name), category)
+		st.logAt(config.LogLevelWarn, "%s - failover - %s", name, category)
 	}
-	s.markCooldown(selected)
+	s.markCooldown(st, candidate, scopeFor(kind, statusCode), &failureRecord{kind: kind, category: category, status: statusCode})
 }
 
-func (s *Server) logCancellation(phase string) {
-	s.logAt(config.LogLevelInfo, "request canceled - %s", phase)
+func (st *snapshot) logCancellation(phase string) {
+	st.logAt(config.LogLevelInfo, "request canceled - %s", phase)
 }
 
-// logAt writes a line only if the configured level permits it.
-func (s *Server) logAt(level config.LogLevel, format string, args ...any) {
-	if !s.logLevel.Enabled(level) {
-		return
-	}
-	s.logger.Printf(format, args...)
-}
-
-func (s *Server) payloadLoggingEnabled() bool {
-	return s.logLevel == config.LogLevelInfo
-}
-
-func (s *Server) logProviderResponse(selected *provider, statusCode int, errorMessage string) {
+func (s *Server) logProviderResponse(st *snapshot, selected *provider, statusCode int, errorMessage string) {
+	name := st.redactProviderSecrets(selected.Name)
 	if statusCode == http.StatusOK && errorMessage == "" {
 		// Successful response status is mandatory operational output at every log level.
-		s.logger.Printf("%s status=%d", s.redactProviderSecrets(selected.Name), statusCode)
+		st.logger.Printf("%s status=%d", name, statusCode)
 		return
 	}
 	if statusCode > 0 {
-		if errorMessage != "" && s.payloadLoggingEnabled() {
-			s.logAt(config.LogLevelInfo, "%s error - status=%d - %s", s.redactProviderSecrets(selected.Name), statusCode, s.sanitizeLogMessage(errorMessage))
+		if errorMessage != "" && st.payloadLoggingEnabled() {
+			st.logAt(config.LogLevelInfo, "%s error - status=%d - %s", name, statusCode, st.sanitizeLogMessage(errorMessage))
 			return
 		}
-		s.logAt(config.LogLevelError, "%s error - status=%d", s.redactProviderSecrets(selected.Name), statusCode)
+		st.logAt(config.LogLevelError, "%s error - status=%d", name, statusCode)
 		return
 	}
 	if errorMessage == "" {
-		s.logAt(config.LogLevelError, "%s error", s.redactProviderSecrets(selected.Name))
+		st.logAt(config.LogLevelError, "%s error", name)
 		return
 	}
-	s.logAt(config.LogLevelError, "%s error - %s", s.redactProviderSecrets(selected.Name), s.sanitizeLogMessage(errorMessage))
-}
-
-func (s *Server) sanitizeLogMessage(message string) string {
-	return sanitizeErrorMessage(s.redactProviderSecrets(message))
-}
-
-func (s *Server) redactProviderSecrets(message string) string {
-	secrets := make([]string, 0, len(s.providers))
-	seen := make(map[string]struct{}, len(s.providers))
-	for _, selected := range s.providers {
-		secret := selected.APIKey
-		if secret == "" {
-			continue
-		}
-		if _, exists := seen[secret]; exists {
-			continue
-		}
-		seen[secret] = struct{}{}
-		secrets = append(secrets, secret)
-	}
-	sort.Slice(secrets, func(i, j int) bool {
-		return len(secrets[i]) > len(secrets[j])
-	})
-	for _, secret := range secrets {
-		message = strings.ReplaceAll(message, "Bearer "+secret, "Bearer [REDACTED]")
-		message = strings.ReplaceAll(message, "bearer "+secret, "bearer [REDACTED]")
-		message = strings.ReplaceAll(message, secret, "[REDACTED]")
-	}
-	return message
+	st.logAt(config.LogLevelError, "%s error - %s", name, st.sanitizeLogMessage(errorMessage))
 }
 
 func readErrorBodyForLog(body io.ReadCloser) ([]byte, error) {
@@ -770,9 +896,9 @@ func applyUpstreamOverrides(payload map[string]json.RawMessage, modelAlias strin
 // setProviderHeaders exposes which upstream actually served the request so
 // clients can attribute usage per provider/model. Set after copyHeaders so an
 // upstream cannot spoof the values with its own headers.
-func setProviderHeaders(destination http.Header, selected *provider) {
-	destination.Set("X-Gonka-Provider", selected.Name)
-	destination.Set("X-Gonka-Model", selected.ModelAlias)
+func setProviderHeaders(destination http.Header, providerName, upstreamModel string) {
+	destination.Set(ProviderHeader, providerName)
+	destination.Set(ModelHeader, upstreamModel)
 }
 
 func copyHeaders(destination, source http.Header) {
