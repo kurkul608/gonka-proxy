@@ -52,11 +52,6 @@ providers:
 `,
 			wantErr: "providers[0].api_key must not be empty",
 		},
-		{
-			name:     "empty Provider list",
-			contents: "reasoning_effort: null\nproviders: []\n",
-			wantErr:  "providers must contain at least one Provider",
-		},
 	}
 
 	for _, test := range tests {

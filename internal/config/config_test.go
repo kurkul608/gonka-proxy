@@ -243,11 +243,6 @@ providers:
 `,
 			want: "providers[0].base_url must use http or https",
 		},
-		{
-			name:     "empty Provider list",
-			contents: "reasoning_effort: max\nproviders: []\n",
-			want:     "providers must contain at least one Provider",
-		},
 	}
 
 	for _, test := range tests {

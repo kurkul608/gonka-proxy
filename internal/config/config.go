@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/url"
@@ -60,6 +61,10 @@ const (
 
 const reasoningEffortErrorMsg = "reasoning_effort must be one of none, low, medium, high, xhigh, max, null"
 
+// ReasoningEffortErrorMessage is the shared enum message, also used for
+// client-supplied values rejected by the proxy.
+const ReasoningEffortErrorMessage = reasoningEffortErrorMsg
+
 // IsValid reports whether the effort is one of the allowed non-null values.
 // Comparison is case-insensitive and trims surrounding whitespace so that
 // programmatic Config values like "MAX" or " Max " are accepted.
@@ -77,6 +82,12 @@ func (r ReasoningEffort) IsValid() bool {
 // like "MAX" behave like loaded YAML values.
 func (r ReasoningEffort) Normalize() ReasoningEffort {
 	return ReasoningEffort(strings.ToLower(strings.TrimSpace(string(r))))
+}
+
+// ParseReasoningEffort normalizes and validates a reasoning_effort string
+// value. It never accepts null; callers handle null separately.
+func ParseReasoningEffort(s string) (*ReasoningEffort, error) {
+	return parseReasoningEffort(s)
 }
 
 // parseReasoningEffort normalizes and validates a reasoning_effort string value.
@@ -98,6 +109,10 @@ func providerReasoningEffortError(index int) error {
 	return fmt.Errorf("providers[%d].%s", index, reasoningEffortErrorMsg)
 }
 
+func modelReasoningEffortError(name string) error {
+	return fmt.Errorf("models[%q].%s", name, reasoningEffortErrorMsg)
+}
+
 // Config is the validated runtime configuration for the proxy.
 type Config struct {
 	ListenAddress         string
@@ -107,48 +122,117 @@ type Config struct {
 	LogLevel              LogLevel
 	ReasoningEffort       *ReasoningEffort
 	FailoverOn404         bool
-	Providers             []Provider
+
+	// FailoverOnAuthError treats upstream 401 and 403 responses as
+	// Failover Failures that cool the whole Provider (its key is rejected).
+	// Off by default so existing configurations keep passing them through.
+	FailoverOnAuthError bool
+
+	// MaxRoutingTime bounds how long one request may spend finding a
+	// Provider (failovers and Recovery Waits included). Zero means no limit.
+	MaxRoutingTime time.Duration
+
+	// AllowClientReasoningEffort lets a valid client-supplied reasoning_effort
+	// win over Virtual Model defaults and the global value (but never over a
+	// Provider override). A Virtual Model may override this switch.
+	AllowClientReasoningEffort bool
+
+	// Models holds optional per-Virtual-Model settings, keyed by Virtual Model.
+	Models map[string]ModelSettings
+
+	Providers []Provider
+}
+
+// ModelSettings are optional per-Virtual-Model settings.
+type ModelSettings struct {
+	// ReasoningEffort is the Virtual Model's default effort; StripReasoningEffort
+	// set means an explicit null (strip the field). Both zero inherits global.
+	ReasoningEffort      *ReasoningEffort
+	StripReasoningEffort bool
+	// AllowClientReasoningEffort overrides the top-level switch when non-nil.
+	AllowClientReasoningEffort *bool
 }
 
 // Provider is one OpenAI-compatible inference endpoint in the routing pool.
 // A provider-level reasoning_effort overrides the global value; an explicit
 // null strips the field for this provider. Leave both zero to inherit global.
+//
+// A Provider sets exactly one of ModelAlias (legacy: serves every Virtual
+// Model and rewrites it to ModelAlias) or Models (serves only the listed
+// Virtual Models, each rewritten to its own upstream model).
 type Provider struct {
 	Name       string
 	BaseURL    string
 	APIKey     string
 	ModelAlias string
+	Models     map[string]string
 	Priority   int
+	// Disabled providers stay configured (and reported) but are never routed to.
+	Disabled bool
 
 	ReasoningEffort      *ReasoningEffort
 	StripReasoningEffort bool
 }
 
+// Legacy reports whether the Provider uses the single model_alias form.
+func (p Provider) Legacy() bool {
+	return len(p.Models) == 0
+}
+
+// UpstreamModel returns the upstream model this Provider uses for a Virtual
+// Model, and whether it serves that Virtual Model at all.
+func (p Provider) UpstreamModel(virtual string) (string, bool) {
+	if p.Legacy() {
+		return p.ModelAlias, true
+	}
+	upstream, ok := p.Models[virtual]
+	return upstream, ok
+}
+
 type rawConfig struct {
-	Server                rawServer     `yaml:"server"`
-	Cooldown              string        `yaml:"cooldown"`
-	RecoveryWait          string        `yaml:"recovery_wait"`
-	ResponseHeaderTimeout string        `yaml:"response_header_timeout"`
-	LogLevel              string        `yaml:"log_level"`
-	ReasoningEffort       *string       `yaml:"reasoning_effort"` // present for KnownFields; value sourced from rawMap to distinguish null vs absent
-	FailoverOn404         bool          `yaml:"failover_on_404"`
-	Providers             []rawProvider `yaml:"providers"`
+	Server                     rawServer           `yaml:"server"`
+	Cooldown                   string              `yaml:"cooldown"`
+	RecoveryWait               string              `yaml:"recovery_wait"`
+	ResponseHeaderTimeout      string              `yaml:"response_header_timeout"`
+	MaxRoutingTime             string              `yaml:"max_routing_time"`
+	LogLevel                   string              `yaml:"log_level"`
+	ReasoningEffort            *string             `yaml:"reasoning_effort"` // present for KnownFields; value sourced from rawMap to distinguish null vs absent
+	AllowClientReasoningEffort bool                `yaml:"allow_client_reasoning_effort"`
+	FailoverOn404              bool                `yaml:"failover_on_404"`
+	FailoverOnAuthError        bool                `yaml:"failover_on_auth_error"`
+	Models                     map[string]rawModel `yaml:"models"`
+	Providers                  []rawProvider       `yaml:"providers"`
 }
 
 type rawServer struct {
 	ListenAddress string `yaml:"listen_address"`
 }
 
+type rawModel struct {
+	ReasoningEffort            yaml.Node `yaml:"reasoning_effort"`
+	AllowClientReasoningEffort *bool     `yaml:"allow_client_reasoning_effort"`
+}
+
 type rawProvider struct {
-	Name       string `yaml:"name"`
-	BaseURL    string `yaml:"base_url"`
-	APIKey     string `yaml:"api_key"`
-	ModelAlias string `yaml:"model_alias"`
-	Priority   *int   `yaml:"priority"`
+	Name       string            `yaml:"name"`
+	BaseURL    string            `yaml:"base_url"`
+	APIKey     string            `yaml:"api_key"`
+	ModelAlias string            `yaml:"model_alias"`
+	Models     map[string]string `yaml:"models"`
+	Priority   *int              `yaml:"priority"`
+	Enabled    *bool             `yaml:"enabled"`
 	// ReasoningEffort keeps the raw node to distinguish absent (inherit
 	// global, zero Node) from explicit null (strip for this provider).
 	ReasoningEffort yaml.Node `yaml:"reasoning_effort"`
 }
+
+// Format is the encoding of a configuration document.
+type Format int
+
+const (
+	FormatYAML Format = iota
+	FormatJSON
+)
 
 // Load reads, defaults, normalizes, and validates one YAML configuration file.
 func Load(path string) (Config, error) {
@@ -156,12 +240,26 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("read config %q: %w", path, err)
 	}
+	return Parse(data, FormatYAML, path)
+}
+
+// Parse decodes, defaults, normalizes, and validates a configuration
+// document. source names the document in error messages. JSON documents use
+// the same keys and rules as YAML files.
+func Parse(data []byte, format Format, source string) (Config, error) {
+	if format == FormatJSON {
+		converted, err := jsonToYAML(data)
+		if err != nil {
+			return Config{}, fmt.Errorf("decode config %q: %w", source, err)
+		}
+		data = converted
+	}
 
 	// Inspect reasoning_effort presence and value before strict struct decoding,
 	// to distinguish absent vs explicit null (both decode as nil into *string).
 	var rawMap map[string]yaml.Node
 	if err := yaml.Unmarshal(data, &rawMap); err != nil {
-		return Config{}, fmt.Errorf("decode config %q: %w", path, err)
+		return Config{}, fmt.Errorf("decode config %q: %w", source, err)
 	}
 	node, ok := rawMap["reasoning_effort"]
 	if !ok {
@@ -186,30 +284,30 @@ func Load(path string) (Config, error) {
 
 	var raw rawConfig
 	if err := decoder.Decode(&raw); err != nil {
-		return Config{}, fmt.Errorf("decode config %q: %w", path, err)
+		return Config{}, fmt.Errorf("decode config %q: %w", source, err)
 	}
 	var extraDocument any
 	if err := decoder.Decode(&extraDocument); err != io.EOF {
 		if err == nil {
-			return Config{}, fmt.Errorf("decode config %q: multiple YAML documents are not supported", path)
+			return Config{}, fmt.Errorf("decode config %q: multiple YAML documents are not supported", source)
 		}
-		return Config{}, fmt.Errorf("decode config %q: %w", path, err)
+		return Config{}, fmt.Errorf("decode config %q: %w", source, err)
 	}
 
 	cfg := Config{
-		ListenAddress:         strings.TrimSpace(raw.Server.ListenAddress),
-		Cooldown:              0,
-		RecoveryWait:          0,
-		ResponseHeaderTimeout: 0,
-		LogLevel:              LogLevel(DefaultLogLevel),
-		ReasoningEffort:       parsedReasoningEffort,
-		FailoverOn404:         raw.FailoverOn404,
-		Providers:             make([]Provider, 0, len(raw.Providers)),
+		ListenAddress:              strings.TrimSpace(raw.Server.ListenAddress),
+		LogLevel:                   LogLevel(DefaultLogLevel),
+		ReasoningEffort:            parsedReasoningEffort,
+		FailoverOn404:              raw.FailoverOn404,
+		FailoverOnAuthError:        raw.FailoverOnAuthError,
+		AllowClientReasoningEffort: raw.AllowClientReasoningEffort,
+		Providers:                  make([]Provider, 0, len(raw.Providers)),
 	}
 	if cfg.ListenAddress == "" {
 		cfg.ListenAddress = DefaultListenAddress
 	}
 
+	var err error
 	if cfg.Cooldown, err = parseDuration("cooldown", raw.Cooldown, DefaultCooldown); err != nil {
 		return Config{}, err
 	}
@@ -219,8 +317,29 @@ func Load(path string) (Config, error) {
 	if cfg.ResponseHeaderTimeout, err = parseDuration("response_header_timeout", raw.ResponseHeaderTimeout, DefaultResponseHeaderTimeout); err != nil {
 		return Config{}, err
 	}
+	if cfg.MaxRoutingTime, err = parseOptionalDuration("max_routing_time", raw.MaxRoutingTime); err != nil {
+		return Config{}, err
+	}
 	if cfg.LogLevel, err = parseLogLevel(raw.LogLevel); err != nil {
 		return Config{}, err
+	}
+
+	if len(raw.Models) > 0 {
+		cfg.Models = make(map[string]ModelSettings, len(raw.Models))
+		for rawName, rawSettings := range raw.Models {
+			name := strings.TrimSpace(rawName)
+			if name == "" {
+				return Config{}, fmt.Errorf("models must not contain an empty Virtual Model name")
+			}
+			if _, exists := cfg.Models[name]; exists {
+				return Config{}, fmt.Errorf("models[%q] is declared more than once", name)
+			}
+			settings, err := normalizeModel(name, rawSettings)
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.Models[name] = settings
+		}
 	}
 
 	for index, rawProvider := range raw.Providers {
@@ -236,7 +355,25 @@ func Load(path string) (Config, error) {
 	return cfg, nil
 }
 
-// Validate ensures a Config can be used to start the proxy.
+// jsonToYAML re-encodes a JSON object as YAML so both formats share one
+// strict decoding path (unknown keys, null handling, typed fields).
+func jsonToYAML(data []byte) ([]byte, error) {
+	var document any
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(&document); err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+	if decoder.More() {
+		return nil, fmt.Errorf("invalid JSON: unexpected data after the top-level value")
+	}
+	if _, ok := document.(map[string]any); !ok {
+		return nil, fmt.Errorf("invalid JSON: the document must be an object")
+	}
+	return yaml.Marshal(document)
+}
+
+// Validate ensures a Config can be used to start the proxy. An empty
+// Provider list is valid: the proxy then answers 503 until one is configured.
 func (c Config) Validate() error {
 	if strings.TrimSpace(c.ListenAddress) == "" {
 		return fmt.Errorf("server.listen_address must not be empty")
@@ -250,11 +387,22 @@ func (c Config) Validate() error {
 	if c.ResponseHeaderTimeout <= 0 {
 		return fmt.Errorf("response_header_timeout must be greater than zero")
 	}
-	if len(c.Providers) == 0 {
-		return fmt.Errorf("providers must contain at least one Provider")
+	if c.MaxRoutingTime < 0 {
+		return fmt.Errorf("max_routing_time must not be negative")
 	}
 	if c.ReasoningEffort != nil && !c.ReasoningEffort.IsValid() {
 		return fmt.Errorf(reasoningEffortErrorMsg)
+	}
+	for name, settings := range c.Models {
+		if strings.TrimSpace(name) == "" || strings.TrimSpace(name) != name {
+			return fmt.Errorf("models[%q] must be a non-empty name without surrounding whitespace", name)
+		}
+		if settings.ReasoningEffort != nil && !settings.ReasoningEffort.IsValid() {
+			return modelReasoningEffortError(name)
+		}
+		if settings.StripReasoningEffort && settings.ReasoningEffort != nil {
+			return fmt.Errorf("models[%q].reasoning_effort must be either null or an effort value", name)
+		}
 	}
 
 	seenNames := make(map[string]int, len(c.Providers))
@@ -274,8 +422,23 @@ func (c Config) Validate() error {
 		if strings.TrimSpace(provider.APIKey) == "" {
 			return fmt.Errorf("providers[%d].api_key must not be empty", index)
 		}
-		if strings.TrimSpace(provider.ModelAlias) == "" {
-			return fmt.Errorf("providers[%d].model_alias must not be empty", index)
+		hasAlias := strings.TrimSpace(provider.ModelAlias) != ""
+		hasModels := provider.Models != nil
+		switch {
+		case hasAlias && hasModels:
+			return fmt.Errorf("providers[%d] must set exactly one of model_alias or models, not both", index)
+		case !hasAlias && !hasModels:
+			return fmt.Errorf("providers[%d].model_alias must not be empty (or set models)", index)
+		case hasModels && len(provider.Models) == 0:
+			return fmt.Errorf("providers[%d].models must not be empty", index)
+		}
+		for virtual, upstream := range provider.Models {
+			if strings.TrimSpace(virtual) == "" || strings.TrimSpace(virtual) != virtual {
+				return fmt.Errorf("providers[%d].models must use non-empty Virtual Model names without surrounding whitespace", index)
+			}
+			if strings.TrimSpace(upstream) == "" {
+				return fmt.Errorf("providers[%d].models[%q] must name an upstream model", index, virtual)
+			}
 		}
 		if provider.ReasoningEffort != nil && !provider.ReasoningEffort.IsValid() {
 			return providerReasoningEffortError(index)
@@ -290,6 +453,7 @@ func (c Config) Validate() error {
 			baseURL:    provider.BaseURL,
 			apiKey:     provider.APIKey,
 			modelAlias: provider.ModelAlias,
+			models:     modelsFingerprint(provider.Models),
 			priority:   provider.Priority,
 		}
 		if _, exists := seen[definitionKey]; exists {
@@ -304,7 +468,16 @@ type providerIdentity struct {
 	baseURL    string
 	apiKey     string
 	modelAlias string
+	models     string
 	priority   int
+}
+
+func modelsFingerprint(models map[string]string) string {
+	if len(models) == 0 {
+		return ""
+	}
+	encoded, _ := json.Marshal(models) // map keys are sorted
+	return string(encoded)
 }
 
 func parseDuration(field, value string, defaultValue time.Duration) (time.Duration, error) {
@@ -318,6 +491,22 @@ func parseDuration(field, value string, defaultValue time.Duration) (time.Durati
 	}
 	if duration <= 0 {
 		return 0, fmt.Errorf("%s must be greater than zero", field)
+	}
+	return duration, nil
+}
+
+// parseOptionalDuration parses a duration where empty or zero means "off".
+func parseOptionalDuration(field, value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "0" {
+		return 0, nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a valid duration such as 60s: %w", field, err)
+	}
+	if duration < 0 {
+		return 0, fmt.Errorf("%s must not be negative", field)
 	}
 	return duration, nil
 }
@@ -337,6 +526,38 @@ func parseLogLevel(value string) (LogLevel, error) {
 	}
 }
 
+// parseEffortNode reads an optional reasoning_effort node: zero node means
+// absent (inherit), null means strip, a string must be in the enum.
+func parseEffortNode(node yaml.Node, invalid error) (*ReasoningEffort, bool, error) {
+	if node.IsZero() {
+		return nil, false, nil
+	}
+	switch node.Tag {
+	case "!!null":
+		return nil, true, nil
+	case "!!str":
+		value, err := parseReasoningEffort(node.Value)
+		if err != nil {
+			return nil, false, invalid
+		}
+		return value, false, nil
+	default:
+		return nil, false, invalid
+	}
+}
+
+func normalizeModel(name string, raw rawModel) (ModelSettings, error) {
+	effort, strip, err := parseEffortNode(raw.ReasoningEffort, modelReasoningEffortError(name))
+	if err != nil {
+		return ModelSettings{}, err
+	}
+	return ModelSettings{
+		ReasoningEffort:            effort,
+		StripReasoningEffort:       strip,
+		AllowClientReasoningEffort: raw.AllowClientReasoningEffort,
+	}, nil
+}
+
 func normalizeProvider(index int, raw rawProvider) (Provider, error) {
 	if raw.Priority == nil {
 		return Provider{}, fmt.Errorf("providers[%d].priority is required", index)
@@ -350,20 +571,20 @@ func normalizeProvider(index int, raw rawProvider) (Provider, error) {
 	parsed.RawPath = ""
 	normalizedURL := strings.TrimRight(parsed.String(), "/")
 
-	var effortOverride *ReasoningEffort
-	var stripEffort bool
-	if node := raw.ReasoningEffort; !node.IsZero() {
-		switch node.Tag {
-		case "!!null":
-			stripEffort = true
-		case "!!str":
-			override, err := parseReasoningEffort(node.Value)
-			if err != nil {
-				return Provider{}, providerReasoningEffortError(index)
+	effortOverride, stripEffort, err := parseEffortNode(raw.ReasoningEffort, providerReasoningEffortError(index))
+	if err != nil {
+		return Provider{}, err
+	}
+
+	var models map[string]string
+	if raw.Models != nil {
+		models = make(map[string]string, len(raw.Models))
+		for virtual, upstream := range raw.Models {
+			name := strings.TrimSpace(virtual)
+			if _, exists := models[name]; exists {
+				return Provider{}, fmt.Errorf("providers[%d].models[%q] is declared more than once", index, name)
 			}
-			effortOverride = override
-		default:
-			return Provider{}, providerReasoningEffortError(index)
+			models[name] = strings.TrimSpace(upstream)
 		}
 	}
 
@@ -372,7 +593,9 @@ func normalizeProvider(index int, raw rawProvider) (Provider, error) {
 		BaseURL:    normalizedURL,
 		APIKey:     strings.TrimSpace(raw.APIKey),
 		ModelAlias: strings.TrimSpace(raw.ModelAlias),
+		Models:     models,
 		Priority:   *raw.Priority,
+		Disabled:   raw.Enabled != nil && !*raw.Enabled,
 
 		ReasoningEffort:      effortOverride,
 		StripReasoningEffort: stripEffort,
