@@ -8,11 +8,13 @@ Copy the documented sample and replace every example Provider value:
 cp config.example.yaml config.yaml
 ```
 
-Each Provider has a human-readable `name`. Its `base_url` is an OpenAI API root, normally ending in `/v1`. The proxy appends `/chat/completions`, replaces the incoming Virtual Model with `model_alias`, and sends the Provider's `api_key` upstream.
+Each Provider has a human-readable `name`. Its `base_url` is an OpenAI API root, normally ending in `/v1`. The proxy appends `/chat/completions`, replaces the incoming Virtual Model with the Provider's Upstream Model (`model_alias`, or the matching entry of its `models` map), and sends the Provider's `api_key` upstream.
 
-Configuration is loaded and validated once during process startup. Edit the mounted file, then restart the container to apply changes; there is no hot reload.
+Configuration is loaded and validated during process startup. To apply an edited file without a restart, send `SIGHUP` (`docker kill -s HUP gonka-proxy`); an invalid file is logged and the running configuration stays. With `GONKA_PROXY_ADMIN_TOKEN` set, configurations can also be pushed over HTTP (`PUT /admin/config`, see the README). `server.listen_address` is read at startup only.
 
-When omitted, `cooldown` defaults to 120s, `recovery_wait` to 30s, `response_header_timeout` to 30s, `failover_on_404` to `false`, and `log_level` to `WARN`.
+When omitted, `cooldown` defaults to 120s, `recovery_wait` to 30s, `response_header_timeout` to 30s, `max_routing_time` to 0 (no limit), `failover_on_404` and `failover_on_auth_error` to `false`, and `log_level` to `WARN`.
+
+To persist admin pushes (`GONKA_PROXY_ADMIN_PERSIST=true`), mount the config *directory* writable (for example `./proxy-config:/etc/gonka-proxy`): the proxy replaces the file with a rename, which a single-file bind mount does not allow.
 
 ## Docker Compose
 
@@ -30,7 +32,7 @@ The production image is multi-stage: the final `scratch` image contains only the
 
 ## OpenCode-compatible Virtual Model
 
-Use the OpenAI-compatible AI SDK adapter with one stable Virtual Model. The client key is only a placeholder; the proxy ignores it.
+Use the OpenAI-compatible AI SDK adapter with one stable Virtual Model. The client key is only a placeholder; the proxy ignores it unless `GONKA_PROXY_CLIENT_TOKEN` is set, in which case it must be that token.
 
 ```ts
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';

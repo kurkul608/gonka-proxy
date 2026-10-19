@@ -1,6 +1,6 @@
 # ADR 0002: Per-Provider Reasoning Effort
 
-**Status:** Accepted (enum restriction superseded by [ADR 0003](0003-reasoning-effort-enum-expansion.md))
+**Status:** Accepted (enum restriction superseded by [ADR 0003](0003-reasoning-effort-enum-expansion.md); resolution order extended by [ADR 0006](0006-reasoning-effort-precedence.md))
 **Date:** 2026-08-25
 **Supersedes (in part):** [ADR 0001](0001-reasoning-effort.md) — the "global-only" clause; its enum restriction, and the restriction repeated here, are superseded by [ADR 0003](0003-reasoning-effort-enum-expansion.md). All other decisions in ADR 0001 stand.
 

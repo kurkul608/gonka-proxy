@@ -1,6 +1,6 @@
 # ADR 0001: Global Reasoning Effort Enforcement
 
-**Status:** Accepted (global-only clause superseded by [ADR 0002](0002-per-provider-reasoning-effort.md); enum restriction superseded by [ADR 0003](0003-reasoning-effort-enum-expansion.md))
+**Status:** Accepted (global-only clause superseded by [ADR 0002](0002-per-provider-reasoning-effort.md); enum restriction superseded by [ADR 0003](0003-reasoning-effort-enum-expansion.md); unconditional client-value overwrite superseded by [ADR 0006](0006-reasoning-effort-precedence.md))
 **Date:** 2026-08-24
 
 This ADR records the original policy. Its global-only clause is superseded by ADR 0002, and its restricted enum is superseded by ADR 0003; those later decisions are normative for current configurations.

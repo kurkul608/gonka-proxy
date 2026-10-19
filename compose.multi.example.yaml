@@ -1,6 +1,8 @@
 # Multiple independent proxy instances, each with its own config file,
 # provider pool, cooldowns, and log level.
 # Copy to compose.yaml (gitignored) and create config-a.yaml / config-b.yaml.
+# Optional per instance: GONKA_PROXY_CLIENT_TOKEN / GONKA_PROXY_ADMIN_TOKEN
+# environment variables (see compose.example.yaml and the README).
 services:
   proxy-a:
     build: .
