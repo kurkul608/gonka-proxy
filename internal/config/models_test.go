@@ -224,6 +224,14 @@ func TestParseJSONRules(t *testing.T) {
 	if cfg.Providers[0].ReasoningEffort == nil || *cfg.Providers[0].ReasoningEffort != config.ReasoningEffortHigh {
 		t.Errorf("provider effort = %v, want high", cfg.Providers[0].ReasoningEffort)
 	}
+
+	large, err := config.Parse([]byte(`{"reasoning_effort":"max","providers":[{"name":"p","base_url":"https://p.example","api_key":"k","model_alias":"m","priority":1000000000}]}`), config.FormatJSON, "json")
+	if err != nil {
+		t.Fatalf("Parse JSON with a large priority: %v", err)
+	}
+	if large.Providers[0].Priority != 1000000000 {
+		t.Errorf("priority = %d, want 1000000000", large.Providers[0].Priority)
+	}
 }
 
 func TestVersionIsStable(t *testing.T) {
@@ -307,5 +315,15 @@ func TestMarshalFileRoundTrips(t *testing.T) {
 	entries, _ := os.ReadDir(filepath.Dir(path))
 	if len(entries) != 1 {
 		t.Fatalf("temporary files left behind: %v", entries)
+	}
+}
+
+func TestExampleConfigLoads(t *testing.T) {
+	cfg, err := config.Load(filepath.Join("..", "..", "config.example.yaml"))
+	if err != nil {
+		t.Fatalf("config.example.yaml: %v", err)
+	}
+	if len(cfg.Providers) == 0 {
+		t.Fatal("config.example.yaml has no providers")
 	}
 }

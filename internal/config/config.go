@@ -360,6 +360,7 @@ func Parse(data []byte, format Format, source string) (Config, error) {
 func jsonToYAML(data []byte) ([]byte, error) {
 	var document any
 	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
 	if err := decoder.Decode(&document); err != nil {
 		return nil, fmt.Errorf("invalid JSON: %w", err)
 	}
@@ -369,7 +370,34 @@ func jsonToYAML(data []byte) ([]byte, error) {
 	if _, ok := document.(map[string]any); !ok {
 		return nil, fmt.Errorf("invalid JSON: the document must be an object")
 	}
-	return yaml.Marshal(document)
+	return yaml.Marshal(plainNumbers(document))
+}
+
+// plainNumbers turns json.Number values into int64 (when integral) or
+// float64 so YAML encodes them as numbers, not quoted strings or exponents.
+func plainNumbers(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, item := range typed {
+			typed[key] = plainNumbers(item)
+		}
+		return typed
+	case []any:
+		for index, item := range typed {
+			typed[index] = plainNumbers(item)
+		}
+		return typed
+	case json.Number:
+		if integer, err := typed.Int64(); err == nil {
+			return integer
+		}
+		if float, err := typed.Float64(); err == nil {
+			return float
+		}
+		return typed.String()
+	default:
+		return value
+	}
 }
 
 // Validate ensures a Config can be used to start the proxy. An empty
