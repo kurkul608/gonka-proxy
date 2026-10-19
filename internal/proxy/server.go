@@ -223,6 +223,11 @@ type chatRequest struct {
 	limit        time.Duration
 }
 
+// MaxChatBodyBytes caps a chat completions request body. It leaves room for
+// base64 images in multimodal requests while keeping one client from
+// exhausting the proxy's memory.
+const MaxChatBodyBytes = 32 << 20
+
 func (s *Server) serveChat(st *snapshot, w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeMethodNotAllowed(w, http.MethodPost)
@@ -233,10 +238,15 @@ func (s *Server) serveChat(st *snapshot, w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxChatBodyBytes))
 	if err != nil {
 		if r.Context().Err() != nil {
 			st.logCancellation("request-body")
+			return
+		}
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			WriteError(w, http.StatusRequestEntityTooLarge, ErrorTypeInvalidRequest, CodeRequestTooLarge, "request body is too large")
 			return
 		}
 		WriteError(w, http.StatusBadRequest, ErrorTypeInvalidRequest, CodeInvalidRequestBody, "could not read request body")

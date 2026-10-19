@@ -742,3 +742,25 @@ func TestMaxRoutingTimeHeaderNotForwarded(t *testing.T) {
 		t.Fatalf("upstream saw %q, want the routing header stripped", calls[0].routingHeader)
 	}
 }
+
+func TestOversizedChatBodyIsRejected(t *testing.T) {
+	a := newFakeUpstream(t)
+	_, server := startProxy(t, testConfig(
+		config.Provider{Name: "a", BaseURL: a.URL, APIKey: "key-a", Priority: 1, Models: map[string]string{"fast": "a-fast"}},
+	), proxy.Options{})
+
+	padding := strings.Repeat("x", proxy.MaxChatBodyBytes)
+	response := postChat(t, server, `{"model":"fast","messages":[{"role":"user","content":"`+padding+`"}]}`, nil)
+	if response.status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", response.status)
+	}
+	if code := response.errorCode(t); code != proxy.CodeRequestTooLarge {
+		t.Fatalf("code = %q, want %q", code, proxy.CodeRequestTooLarge)
+	}
+	if calls := a.calls(); len(calls) != 0 {
+		t.Fatalf("upstream received %d requests", len(calls))
+	}
+	if response := postChat(t, server, chatBody("fast"), nil); response.status != http.StatusOK {
+		t.Fatalf("normal request status = %d", response.status)
+	}
+}

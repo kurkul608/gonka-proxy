@@ -100,6 +100,7 @@ providers:
 - A provider must set exactly one of `model_alias` and `models`.
 - `GET /v1/models` lists the virtual models (from the `models` maps and the `models:` section) — or, with only `model_alias` providers, each alias once.
 - Responses carry `X-Gonka-Provider` (provider name) and `X-Gonka-Model` (the upstream model actually used).
+- A chat request body over 32 MiB gets `413 request_too_large` and never reaches a provider.
 
 **Cooldowns are per provider *and* model.** A 5xx, timeout, 404 or unsupported `reasoning_effort` benches only that model on that provider; its other models keep serving. Failures about the account or the host — 402, 429, network errors, and 401/403 with `failover_on_auth_error` — bench the whole provider. See [ADR 0004](docs/adr/0004-multi-model-routing-and-cooldown-scope.md).
 

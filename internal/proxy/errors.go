@@ -19,6 +19,7 @@ const (
 	CodeInvalidRequestBody     = "invalid_request_body"
 	CodeMethodNotAllowed       = "method_not_allowed"
 	CodeUpstreamRequestFailed  = "upstream_request_failed"
+	CodeRequestTooLarge        = "request_too_large"
 )
 
 type errorBody struct {
