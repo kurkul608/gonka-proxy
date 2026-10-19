@@ -67,6 +67,22 @@ func (e EffortSetting) MarshalJSON() ([]byte, error) {
 	return json.Marshal(string(e.Value))
 }
 
+// UnmarshalJSON decodes a string value. (encoding/json leaves a nil
+// *EffortSetting for null, so a decoded Document cannot tell null from absent;
+// Parse, which reads the raw document, can.)
+func (e *EffortSetting) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		*e = EffortSetting{Strip: true}
+		return nil
+	}
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*e = EffortSetting{Value: ReasoningEffort(value)}
+	return nil
+}
+
 // MarshalYAML encodes a strip as null and a value as a string.
 func (e EffortSetting) MarshalYAML() (any, error) {
 	if e.Strip {
