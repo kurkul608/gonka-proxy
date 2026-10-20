@@ -66,4 +66,4 @@ The bearer token (`GONKA_PROXY_ADMIN_TOKEN`) that enables and guards the `/admin
 The optional bearer token (`GONKA_PROXY_CLIENT_TOKEN`) clients must send to `/v1/*`. It is never forwarded upstream; Providers always receive their own API key.
 
 **Route Stats**:
-In-memory traffic statistics per (Provider, Upstream Model) pair reported by `GET /admin/status`: attempt counters (successes, failures by class, cancels, Client Errors) since start and over a sliding window, plus TTFB and output tokens/s as an EWMA and windowed p50/p95. Client cancels are never failures.
+In-memory traffic statistics per (Provider, Upstream Model) pair reported by `GET /admin/status`. They hold attempt counters since start and over a sliding window: successes, failures by class, cancels, Client Errors and routing deadlines. They also hold TTFB and output tokens/s per response mode (stream, non-stream), each as an EWMA and windowed p50/p95. Cancels, Client Errors and client-chosen routing deadlines are never failures. A 401, 403 or 404 always is.

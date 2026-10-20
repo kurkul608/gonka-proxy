@@ -301,7 +301,7 @@ The provider-level `cooldown_until` / `last_failure` describe provider-wide cool
 
 ### Route stats
 
-`GET /admin/status` also reports traffic per **(provider, upstream model)** pair, one entry for every configured pair (disabled providers included), in routing order (provider priority, then upstream model by name). Every upstream attempt counts, failovers included, so one client request that failed over from `gate-a` to `gate-b` adds a failure to `gate-a` and a success to `gate-b`. API keys and base URLs are never included.
+`GET /admin/status` also reports traffic per **(provider, upstream model)** pair. There is one entry for every configured pair, disabled providers included, in routing order: provider priority, then upstream model by name. Every upstream attempt counts, failovers included. A client request that failed over from `gate-a` to `gate-b` therefore adds a failure to `gate-a` and a success to `gate-b`. API keys and base URLs are never included.
 
 ```json
 {
@@ -318,17 +318,23 @@ The provider-level `cooldown_until` / `last_failure` describe provider-wide cool
       "enabled": true,
       "since": "2026-10-19T12:00:00.000Z",
       "total": {
-        "requests": 120, "successes": 112, "failures": 6,
+        "requests": 121, "successes": 112, "failures": 6,
         "failures_by_class": {"timeout": 2, "5xx": 3, "4xx": 1, "connection": 0},
-        "canceled": 1, "client_errors": 1
+        "canceled": 1, "client_errors": 1, "deadline": 1
       },
       "window": {
         "requests": 14, "successes": 13, "failures": 1,
         "failures_by_class": {"timeout": 0, "5xx": 1, "4xx": 0, "connection": 0},
-        "canceled": 0, "client_errors": 0
+        "canceled": 0, "client_errors": 0, "deadline": 0
       },
-      "ttfb_ms":           {"ewma": 412.5, "p50": 380.2, "p95": 910.7, "samples": 112, "window_samples": 13},
-      "tokens_per_second": {"ewma": 38.1,  "p50": 36.4,  "p95": 51.9,  "samples": 97,  "window_samples": 11},
+      "ttfb_ms": {
+        "stream":     {"ewma": 412.5, "p50": 380.2, "p95": 910.7, "samples": 80, "window_samples": 9, "window_samples_truncated": false},
+        "non_stream": {"ewma": 2210.4, "p50": 1980.0, "p95": 4105.3, "samples": 32, "window_samples": 4, "window_samples_truncated": false}
+      },
+      "tokens_per_second": {
+        "stream":     {"ewma": 38.1, "p50": 36.4, "p95": 51.9, "samples": 74, "window_samples": 8, "window_samples_truncated": false},
+        "non_stream": {"ewma": 21.7, "p50": 20.9, "p95": 27.5, "samples": 30, "window_samples": 4, "window_samples_truncated": false}
+      },
       "last_success_at": "2026-10-19T12:14:58.120Z",
       "last_failure_at": "2026-10-19T12:09:03.554Z",
       "last_error_class": "5xx"
@@ -336,10 +342,16 @@ The provider-level `cooldown_until` / `last_failure` describe provider-wide cool
     {
       "provider": "gate-a", "upstream": "deepseek-v4-flash", "virtual_models": ["chat-fast"], "enabled": true,
       "since": "2026-10-19T12:00:00.000Z",
-      "total":  {"requests": 0, "successes": 0, "failures": 0, "failures_by_class": {"timeout": 0, "5xx": 0, "4xx": 0, "connection": 0}, "canceled": 0, "client_errors": 0},
-      "window": {"requests": 0, "successes": 0, "failures": 0, "failures_by_class": {"timeout": 0, "5xx": 0, "4xx": 0, "connection": 0}, "canceled": 0, "client_errors": 0},
-      "ttfb_ms":           {"ewma": null, "p50": null, "p95": null, "samples": 0, "window_samples": 0},
-      "tokens_per_second": {"ewma": null, "p50": null, "p95": null, "samples": 0, "window_samples": 0},
+      "total":  {"requests": 0, "successes": 0, "failures": 0, "failures_by_class": {"timeout": 0, "5xx": 0, "4xx": 0, "connection": 0}, "canceled": 0, "client_errors": 0, "deadline": 0},
+      "window": {"requests": 0, "successes": 0, "failures": 0, "failures_by_class": {"timeout": 0, "5xx": 0, "4xx": 0, "connection": 0}, "canceled": 0, "client_errors": 0, "deadline": 0},
+      "ttfb_ms": {
+        "stream":     {"ewma": null, "p50": null, "p95": null, "samples": 0, "window_samples": 0, "window_samples_truncated": false},
+        "non_stream": {"ewma": null, "p50": null, "p95": null, "samples": 0, "window_samples": 0, "window_samples_truncated": false}
+      },
+      "tokens_per_second": {
+        "stream":     {"ewma": null, "p50": null, "p95": null, "samples": 0, "window_samples": 0, "window_samples_truncated": false},
+        "non_stream": {"ewma": null, "p50": null, "p95": null, "samples": 0, "window_samples": 0, "window_samples_truncated": false}
+      },
       "last_success_at": null, "last_failure_at": null, "last_error_class": null
     }
   ]
@@ -348,19 +360,21 @@ The provider-level `cooldown_until` / `last_failure` describe provider-wide cool
 
 | Field | Meaning |
 | --- | --- |
-| `provider`, `upstream` | The provider name and upstream model: the values of the `X-Gonka-Provider` and `X-Gonka-Model` response headers. Together they identify the entry. |
-| `virtual_models` | Virtual models this provider routes to `upstream`, sorted (`["*"]` for a `model_alias` provider). Several virtual models can share one upstream model and so one entry. |
-| `enabled` | `false` for a disabled provider (it keeps its stats but gets no traffic). |
+| `provider`, `upstream` | The provider name and upstream model, which are the values of the `X-Gonka-Provider` and `X-Gonka-Model` response headers. Together they identify the entry. |
+| `virtual_models` | The virtual models this provider routes to `upstream`, sorted (`["*"]` for a `model_alias` provider). Several virtual models can share one upstream model, and so one entry. |
+| `enabled` | `false` for a disabled provider. It keeps its stats but gets no traffic. |
 | `since` | When counting started: process start, or the reload that added the pair. Timestamps are RFC 3339 UTC with milliseconds. |
-| `total` / `window` | Counters since `since` / over the last `stats_window_seconds` (resolution: 1/60 of the window). `requests = successes + failures + canceled + client_errors`. |
-| `failures` | Failures of the provider, split in `failures_by_class`: `timeout` (response headers or the routing time limit ran out, or a body read timed out), `5xx`, `4xx` (402, 429, and the 401/403/404/unsupported-`reasoning_effort` 400 that trigger failover), `connection` (connect error, broken body, or a stream that ended without `[DONE]`). |
+| `total` / `window` | Counters since `since` / over the last `stats_window_seconds` (resolution: 1/60 of the window). `requests = successes + failures + canceled + client_errors + deadline`. |
+| `failures` | Failures of the provider, split in `failures_by_class`. **`timeout`**: the response headers did not arrive within `response_header_timeout` or the operator's `max_routing_time`, or a body read timed out. **`5xx`**: a 5xx answer. **`4xx`**: 402 or 429, the 400 for an unsupported `reasoning_effort`, and 401, 403 and 404. A 401, 403 or 404 means a rejected key or a missing upstream model, so it counts even when it is passed back to the client because the failover switches are off. **`connection`**: a connect error, a broken or reset body, or a stream that ended without `[DONE]`. |
 | `canceled` | The client went away (closed the connection or stopped reading). **Not** a failure. |
-| `client_errors` | A 4xx passed back to the client unchanged (the request was bad). Not a failure, not a success. |
-| `ttfb_ms` | Time from sending the upstream request to the first byte of the response body (the first chunk for a stream), in ms, for successful attempts. |
-| `tokens_per_second` | Output rate of successful attempts: `usage.completion_tokens` from the upstream response (the last `usage` in a stream, so streams need `stream_options.include_usage` or a provider that always sends it) divided by the time from the first chunk to the end for streams, or by the whole attempt for non-streaming responses. Attempts without usage add no sample. |
-| `ewma` | Exponentially weighted moving average over all samples since `since` (`stats_ewma_alpha` = weight of the newest). |
-| `p50`, `p95` | Nearest-rank percentiles of the samples inside the window. At most the 1024 newest samples per metric are kept, so under heavy traffic they cover the newest 1024. |
-| `samples`, `window_samples` | Samples since `since` / inside the window. `ewma`, `p50`, `p95` are `null` without samples. |
-| `last_success_at`, `last_failure_at`, `last_error_class` | `null` until the first success or failure. Cancels and client errors change neither. |
+| `client_errors` | A client-caused 4xx (400, 422, …) passed back to the client unchanged. It is neither a failure nor a success. |
+| `deadline` | The request's routing deadline cut the attempt. Either the client's shorter `X-Gonka-Max-Routing-Time` ran out while the provider had not answered, or the provider answered but the deadline (from either source) expired first. **Not** a failure. When the operator's `max_routing_time` runs out before the provider answers, it counts as a `timeout` failure instead. |
+| `ttfb_ms.{stream,non_stream}` | Time from sending the upstream request to the first byte of the response body (the first chunk for a stream), in ms. Measured only for successful attempts. |
+| `tokens_per_second.{stream,non_stream}` | Output rate of successful attempts: `usage.completion_tokens` from the upstream response divided by the generation time. For streams the time runs from the first chunk to the end, for non-streaming responses over the whole attempt. Attempts without usage add no sample. For streams, the proxy reads the last `usage` chunk, which upstreams send only when the client asks with `"stream_options": {"include_usage": true}`. The proxy does not add that option itself: clients that want stream samples must send it. |
+| `ewma` | Exponentially weighted moving average over all samples since `since`. `stats_ewma_alpha` is the weight of the newest sample. |
+| `p50`, `p95` | Nearest-rank percentiles of the samples inside the window. |
+| `samples`, `window_samples` | Samples since `since` / inside the window. `ewma`, `p50` and `p95` are `null` without samples. |
+| `window_samples_truncated` | `true` when the window held more samples than the 1024 kept per metric and mode. The percentiles then cover only the newest 1024. |
+| `last_success_at`, `last_failure_at`, `last_error_class` | `null` until the first success or failure. Cancels, client errors and deadlines change none of them. |
 
-Stats live in memory and restart from zero with the process. On a hot reload, pairs whose provider name, `base_url` and upstream model are unchanged keep their stats (a rotated `api_key` or a new priority keeps them); removed pairs are dropped, and a pair added again starts from zero. See [ADR 0008](docs/adr/0008-route-stats.md).
+Stats live in memory and restart from zero with the process. On a hot reload, pairs whose provider name, `base_url` and upstream model are unchanged keep their stats, even if the `api_key` or priority changed. Removed pairs are dropped, and a pair that is added again starts from zero. A request still running on the old configuration when its pair is removed is not counted. See [ADR 0008](docs/adr/0008-route-stats.md).
