@@ -247,6 +247,8 @@ Both tokens are read from the environment, never from the config file:
 | `GONKA_PROXY_ADMIN_TOKEN` | Enables the admin API (at least 16 characters, or the proxy refuses to start). Unset: `/admin/*` answers `404`. |
 | `GONKA_PROXY_ADMIN_LISTEN_ADDRESS` | Optional `host:port` for a separate admin listener; `/admin/*` is then served only there. Default: the proxy's own port. |
 | `GONKA_PROXY_ADMIN_PERSIST` | `true` writes every accepted admin config back to the `--config` file (atomically, mode 0600). Needs the config **directory** mounted writable. Default `false`. |
+| `GONKA_PROXY_STATS_WINDOW` | Sliding window of the [route stats](#route-stats) (windowed counters and p50/p95), a duration of at least `1s`. Default `15m`. |
+| `GONKA_PROXY_STATS_EWMA_ALPHA` | Weight of the newest sample in the TTFB and tokens/s EWMAs, `0 < alpha ≤ 1`. Default `0.2`. |
 
 Tokens are compared in constant time.
 
@@ -296,3 +298,69 @@ curl -sS -X PUT http://gonka-proxy:8080/admin/config \
 ```
 
 The provider-level `cooldown_until` / `last_failure` describe provider-wide cooldowns; the model entries combine both. `kind` is `status`, `timeout`, `network` or `stream`; `scope` is `provider` or `model`. A `model_alias` provider reports one model with `"virtual": "*"`. See [ADR 0005](docs/adr/0005-admin-api-and-hot-reload.md).
+
+### Route stats
+
+`GET /admin/status` also reports traffic per **(provider, upstream model)** pair, one entry for every configured pair (disabled providers included), in routing order (provider priority, then upstream model by name). Every upstream attempt counts, failovers included, so one client request that failed over from `gate-a` to `gate-b` adds a failure to `gate-a` and a success to `gate-b`. API keys and base URLs are never included.
+
+```json
+{
+  "version": "5f0c…",
+  "loaded_at": "2026-10-19T12:00:00Z",
+  "providers": 1, "enabled_providers": 1, "provider_status": [ … ],
+  "stats_window_seconds": 900,
+  "stats_ewma_alpha": 0.2,
+  "stats": [
+    {
+      "provider": "gate-a",
+      "upstream": "deepseek-v4",
+      "virtual_models": ["chat-smart"],
+      "enabled": true,
+      "since": "2026-10-19T12:00:00.000Z",
+      "total": {
+        "requests": 120, "successes": 112, "failures": 6,
+        "failures_by_class": {"timeout": 2, "5xx": 3, "4xx": 1, "connection": 0},
+        "canceled": 1, "client_errors": 1
+      },
+      "window": {
+        "requests": 14, "successes": 13, "failures": 1,
+        "failures_by_class": {"timeout": 0, "5xx": 1, "4xx": 0, "connection": 0},
+        "canceled": 0, "client_errors": 0
+      },
+      "ttfb_ms":           {"ewma": 412.5, "p50": 380.2, "p95": 910.7, "samples": 112, "window_samples": 13},
+      "tokens_per_second": {"ewma": 38.1,  "p50": 36.4,  "p95": 51.9,  "samples": 97,  "window_samples": 11},
+      "last_success_at": "2026-10-19T12:14:58.120Z",
+      "last_failure_at": "2026-10-19T12:09:03.554Z",
+      "last_error_class": "5xx"
+    },
+    {
+      "provider": "gate-a", "upstream": "deepseek-v4-flash", "virtual_models": ["chat-fast"], "enabled": true,
+      "since": "2026-10-19T12:00:00.000Z",
+      "total":  {"requests": 0, "successes": 0, "failures": 0, "failures_by_class": {"timeout": 0, "5xx": 0, "4xx": 0, "connection": 0}, "canceled": 0, "client_errors": 0},
+      "window": {"requests": 0, "successes": 0, "failures": 0, "failures_by_class": {"timeout": 0, "5xx": 0, "4xx": 0, "connection": 0}, "canceled": 0, "client_errors": 0},
+      "ttfb_ms":           {"ewma": null, "p50": null, "p95": null, "samples": 0, "window_samples": 0},
+      "tokens_per_second": {"ewma": null, "p50": null, "p95": null, "samples": 0, "window_samples": 0},
+      "last_success_at": null, "last_failure_at": null, "last_error_class": null
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `provider`, `upstream` | The provider name and upstream model: the values of the `X-Gonka-Provider` and `X-Gonka-Model` response headers. Together they identify the entry. |
+| `virtual_models` | Virtual models this provider routes to `upstream`, sorted (`["*"]` for a `model_alias` provider). Several virtual models can share one upstream model and so one entry. |
+| `enabled` | `false` for a disabled provider (it keeps its stats but gets no traffic). |
+| `since` | When counting started: process start, or the reload that added the pair. Timestamps are RFC 3339 UTC with milliseconds. |
+| `total` / `window` | Counters since `since` / over the last `stats_window_seconds` (resolution: 1/60 of the window). `requests = successes + failures + canceled + client_errors`. |
+| `failures` | Failures of the provider, split in `failures_by_class`: `timeout` (response headers or the routing time limit ran out, or a body read timed out), `5xx`, `4xx` (402, 429, and the 401/403/404/unsupported-`reasoning_effort` 400 that trigger failover), `connection` (connect error, broken body, or a stream that ended without `[DONE]`). |
+| `canceled` | The client went away (closed the connection or stopped reading). **Not** a failure. |
+| `client_errors` | A 4xx passed back to the client unchanged (the request was bad). Not a failure, not a success. |
+| `ttfb_ms` | Time from sending the upstream request to the first byte of the response body (the first chunk for a stream), in ms, for successful attempts. |
+| `tokens_per_second` | Output rate of successful attempts: `usage.completion_tokens` from the upstream response (the last `usage` in a stream, so streams need `stream_options.include_usage` or a provider that always sends it) divided by the time from the first chunk to the end for streams, or by the whole attempt for non-streaming responses. Attempts without usage add no sample. |
+| `ewma` | Exponentially weighted moving average over all samples since `since` (`stats_ewma_alpha` = weight of the newest). |
+| `p50`, `p95` | Nearest-rank percentiles of the samples inside the window. At most the 1024 newest samples per metric are kept, so under heavy traffic they cover the newest 1024. |
+| `samples`, `window_samples` | Samples since `since` / inside the window. `ewma`, `p50`, `p95` are `null` without samples. |
+| `last_success_at`, `last_failure_at`, `last_error_class` | `null` until the first success or failure. Cancels and client errors change neither. |
+
+Stats live in memory and restart from zero with the process. On a hot reload, pairs whose provider name, `base_url` and upstream model are unchanged keep their stats (a rotated `api_key` or a new priority keeps them); removed pairs are dropped, and a pair added again starts from zero. See [ADR 0008](docs/adr/0008-route-stats.md).
