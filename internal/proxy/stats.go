@@ -4,7 +4,6 @@ import (
 	"math"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -20,13 +19,15 @@ const (
 	// counters: the window covered is between window*(1-1/statsBuckets) and
 	// window.
 	statsBuckets = 60
-	// statsSampleCap bounds the samples kept per metric and key for the
-	// windowed percentiles. With more samples than this inside the window,
-	// percentiles describe the most recent statsSampleCap of them.
+	// statsSampleCap bounds the samples kept per metric, mode and route for
+	// the windowed percentiles. With more samples than this inside the
+	// window, percentiles describe the most recent statsSampleCap of them
+	// (window_samples_truncated).
 	statsSampleCap = 1024
 )
 
-// Failure classes of a upstream attempt. A client cancel is not a failure.
+// Failure classes of an upstream attempt. A client cancel, a Client Error
+// and a routing deadline are not failures.
 const (
 	statsClassTimeout    = "timeout"
 	statsClassServer     = "5xx"
@@ -42,16 +43,29 @@ const (
 	outcomeFailure
 	// outcomeCanceled: the client went away; not the Provider's fault.
 	outcomeCanceled
-	// outcomeClientError: a 4xx passed back to the client unchanged (the
-	// request was bad, not the Provider).
+	// outcomeClientError: a client-caused 4xx (400, 422, ...) passed back to
+	// the client unchanged.
 	outcomeClientError
+	// outcomeDeadline: the request's routing deadline ran out while this
+	// attempt was in flight, either because the client chose a short
+	// X-Gonka-Max-Routing-Time or because the deadline won a race with the
+	// response. Not the Provider's fault.
+	outcomeDeadline
 )
 
-// attemptRecord is one finished attempt as seen by the stats registry.
+// Response modes for the TTFB and tokens/s metrics.
+const (
+	modeNonStream = 0
+	modeStream    = 1
+	statsModes    = 2
+)
+
+// attemptRecord is one finished attempt as seen by the stats.
 type attemptRecord struct {
-	outcome attemptOutcome
-	class   string // failure class when outcome == outcomeFailure
-	at      time.Time
+	outcome   attemptOutcome
+	class     string // failure class when outcome == outcomeFailure
+	at        time.Time
+	streaming bool
 	// ttfb is the time to the first upstream body byte; zero means no sample.
 	ttfb time.Duration
 	// tokensPerSecond is the output rate from upstream usage; zero means no sample.
@@ -83,16 +97,22 @@ func (s StatsSettings) normalized() StatsSettings {
 	return s
 }
 
-// statsRegistry holds the stats of every configured (Provider, Upstream
-// Model). The key set changes only on (re)configuration, so the map is
-// copy-on-write behind an atomic pointer: the record path never takes a
-// registry-wide lock.
-type statsRegistry struct {
-	settings StatsSettings
-	bucket   time.Duration
+// statsConfig is shared, read-only configuration of every routeStats.
+type statsConfig struct {
+	window time.Duration
+	alpha  float64
+	bucket time.Duration
+}
 
-	syncMu  sync.Mutex
-	entries atomic.Pointer[map[statsKey]*routeStats]
+// statsRegistry keeps routeStats alive across reloads. It is touched only
+// when a snapshot is installed; requests record through the pointers their
+// snapshot resolved at build time, so a route a reload removed keeps
+// recording into a detached entry that dies with its snapshot.
+type statsRegistry struct {
+	cfg *statsConfig
+
+	mu      sync.Mutex
+	entries map[statsKey]*routeStats
 }
 
 func newStatsRegistry(settings StatsSettings) *statsRegistry {
@@ -101,69 +121,68 @@ func newStatsRegistry(settings StatsSettings) *statsRegistry {
 	if bucket <= 0 {
 		bucket = 1
 	}
-	registry := &statsRegistry{settings: settings, bucket: bucket}
-	empty := map[statsKey]*routeStats{}
-	registry.entries.Store(&empty)
-	return registry
+	return &statsRegistry{
+		cfg:     &statsConfig{window: settings.Window, alpha: settings.EWMAAlpha, bucket: bucket},
+		entries: make(map[statsKey]*routeStats),
+	}
 }
 
-// sync makes the key set match keys at time now: entries for removed keys
-// are dropped, kept ones keep their state, new ones start empty.
-func (r *statsRegistry) sync(keys []statsKey, now time.Time) {
-	r.syncMu.Lock()
-	defer r.syncMu.Unlock()
-	current := *r.entries.Load()
-	next := make(map[statsKey]*routeStats, len(keys))
+func (r *statsRegistry) settings() StatsSettings {
+	return StatsSettings{Window: r.cfg.window, EWMAAlpha: r.cfg.alpha}
+}
+
+// ensure returns the entries for keys, creating missing ones as of now.
+// Existing entries keep their state.
+func (r *statsRegistry) ensure(keys []statsKey, now time.Time) map[statsKey]*routeStats {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	resolved := make(map[statsKey]*routeStats, len(keys))
 	for _, key := range keys {
-		if entry, ok := current[key]; ok {
-			next[key] = entry
-			continue
+		entry := r.entries[key]
+		if entry == nil {
+			entry = newRouteStats(r.cfg, now)
+			r.entries[key] = entry
 		}
-		next[key] = newRouteStats(now)
+		resolved[key] = entry
 	}
-	r.entries.Store(&next)
+	return resolved
 }
 
-// record adds one attempt. Attempts for keys that are not configured (for
-// example from a request still running on a snapshot whose route a reload
-// removed) are ignored, so removed routes do not come back.
-func (r *statsRegistry) record(key statsKey, attempt attemptRecord) {
-	entry := (*r.entries.Load())[key]
-	if entry == nil {
-		return
+// retain drops every entry whose key is not in keys.
+func (r *statsRegistry) retain(keys []statsKey) {
+	keep := make(map[statsKey]struct{}, len(keys))
+	for _, key := range keys {
+		keep[key] = struct{}{}
 	}
-	entry.record(r, attempt)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key := range r.entries {
+		if _, ok := keep[key]; !ok {
+			delete(r.entries, key)
+		}
+	}
 }
 
-// view returns a copy of every entry's aggregates at time now.
-func (r *statsRegistry) view(now time.Time) map[statsKey]routeStatsView {
-	entries := *r.entries.Load()
-	views := make(map[statsKey]routeStatsView, len(entries))
-	for key, entry := range entries {
-		views[key] = entry.view(r, now)
-	}
-	return views
-}
-
-// routeStats is the state of one key. Its mutex is held only for in-memory
-// updates, never across I/O.
+// routeStats is the state of one route. Its mutex is held only for
+// in-memory updates and copies, never across I/O.
 type routeStats struct {
-	mu sync.Mutex
+	cfg *statsConfig
 
+	mu      sync.Mutex
 	since   time.Time
 	total   statsCounters
 	buckets [statsBuckets]statsBucket
 
-	ttfb ewmaRing
-	tps  ewmaRing
+	ttfb [statsModes]ewmaRing
+	tps  [statsModes]ewmaRing
 
 	lastSuccess    time.Time
 	lastFailure    time.Time
 	lastErrorClass string
 }
 
-func newRouteStats(now time.Time) *routeStats {
-	return &routeStats{since: now}
+func newRouteStats(cfg *statsConfig, now time.Time) *routeStats {
+	return &routeStats{cfg: cfg, since: now}
 }
 
 type statsCounters struct {
@@ -172,6 +191,7 @@ type statsCounters struct {
 	failures     uint64
 	canceled     uint64
 	clientErrors uint64
+	deadline     uint64
 	timeout      uint64
 	server       uint64
 	client       uint64
@@ -187,6 +207,8 @@ func (c *statsCounters) add(attempt attemptRecord) {
 		c.canceled++
 	case outcomeClientError:
 		c.clientErrors++
+	case outcomeDeadline:
+		c.deadline++
 	case outcomeFailure:
 		c.failures++
 		switch attempt.class {
@@ -208,6 +230,7 @@ func (c *statsCounters) merge(other statsCounters) {
 	c.failures += other.failures
 	c.canceled += other.canceled
 	c.clientErrors += other.clientErrors
+	c.deadline += other.deadline
 	c.timeout += other.timeout
 	c.server += other.server
 	c.client += other.client
@@ -248,21 +271,43 @@ func (e *ewmaRing) add(value float64, at time.Time, alpha float64) {
 	}
 }
 
-// windowValues returns the samples newer than cutoff, sorted.
-func (e *ewmaRing) windowValues(cutoff int64) []float64 {
-	values := make([]float64, 0, e.written)
-	for index := 0; index < e.written; index++ {
-		if e.stamps[index] > cutoff {
-			values = append(values, e.values[index])
-		}
-	}
-	sort.Float64s(values)
-	return values
+// ringCopy is a copy of a ring taken under the lock, so filtering and
+// sorting run after Unlock.
+type ringCopy struct {
+	ewma   float64
+	count  uint64
+	values []float64
+	stamps []int64
+	full   bool
+	oldest int64 // stamp of the oldest kept sample when the ring is full
 }
 
-func (g *routeStats) record(r *statsRegistry, attempt attemptRecord) {
-	epoch := attempt.at.UnixNano() / int64(r.bucket)
+func (e *ewmaRing) copyOut() ringCopy {
+	out := ringCopy{
+		ewma:   e.ewma,
+		count:  e.count,
+		values: append([]float64(nil), e.values[:e.written]...),
+		stamps: append([]int64(nil), e.stamps[:e.written]...),
+		full:   e.written == statsSampleCap,
+	}
+	if out.full {
+		out.oldest = e.stamps[e.next]
+	}
+	return out
+}
+
+// record adds one attempt. A nil receiver (a route without stats) is a no-op.
+func (g *routeStats) record(attempt attemptRecord) {
+	if g == nil {
+		return
+	}
+	cfg := g.cfg
+	epoch := attempt.at.UnixNano() / int64(cfg.bucket)
 	slot := int(epoch % statsBuckets)
+	mode := modeNonStream
+	if attempt.streaming {
+		mode = modeStream
+	}
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -281,10 +326,10 @@ func (g *routeStats) record(r *statsRegistry, attempt attemptRecord) {
 		g.lastErrorClass = attempt.class
 	}
 	if attempt.ttfb > 0 {
-		g.ttfb.add(float64(attempt.ttfb)/float64(time.Millisecond), attempt.at, r.settings.EWMAAlpha)
+		g.ttfb[mode].add(float64(attempt.ttfb)/float64(time.Millisecond), attempt.at, cfg.alpha)
 	}
 	if attempt.tokensPerSecond > 0 && !math.IsInf(attempt.tokensPerSecond, 0) && !math.IsNaN(attempt.tokensPerSecond) {
-		g.tps.add(attempt.tokensPerSecond, attempt.at, r.settings.EWMAAlpha)
+		g.tps[mode].add(attempt.tokensPerSecond, attempt.at, cfg.alpha)
 	}
 }
 
@@ -293,8 +338,8 @@ type routeStatsView struct {
 	since          time.Time
 	total          statsCounters
 	window         statsCounters
-	ttfb           metricView
-	tps            metricView
+	ttfb           [statsModes]metricView
+	tps            [statsModes]metricView
 	lastSuccess    time.Time
 	lastFailure    time.Time
 	lastErrorClass string
@@ -304,13 +349,16 @@ type metricView struct {
 	ewma          float64
 	count         uint64
 	windowSamples int
+	truncated     bool
 	p50, p95      float64
 }
 
-func (g *routeStats) view(r *statsRegistry, now time.Time) routeStatsView {
-	nowEpoch := now.UnixNano() / int64(r.bucket)
-	cutoff := now.Add(-r.settings.Window).UnixNano()
+func (g *routeStats) view(now time.Time) routeStatsView {
+	cfg := g.cfg
+	nowEpoch := now.UnixNano() / int64(cfg.bucket)
+	cutoff := now.Add(-cfg.window).UnixNano()
 
+	var ttfb, tps [statsModes]ringCopy
 	g.mu.Lock()
 	view := routeStatsView{
 		since:          g.since,
@@ -325,24 +373,38 @@ func (g *routeStats) view(r *statsRegistry, now time.Time) routeStatsView {
 			view.window.merge(bucket.counters)
 		}
 	}
-	ttfbValues := g.ttfb.windowValues(cutoff)
-	tpsValues := g.tps.windowValues(cutoff)
-	view.ttfb = metricView{ewma: g.ttfb.ewma, count: g.ttfb.count}
-	view.tps = metricView{ewma: g.tps.ewma, count: g.tps.count}
+	for mode := 0; mode < statsModes; mode++ {
+		ttfb[mode] = g.ttfb[mode].copyOut()
+		tps[mode] = g.tps[mode].copyOut()
+	}
 	g.mu.Unlock()
 
-	view.ttfb.fill(ttfbValues)
-	view.tps.fill(tpsValues)
+	for mode := 0; mode < statsModes; mode++ {
+		view.ttfb[mode] = ttfb[mode].metric(cutoff)
+		view.tps[mode] = tps[mode].metric(cutoff)
+	}
 	return view
 }
 
-func (m *metricView) fill(sorted []float64) {
-	m.windowSamples = len(sorted)
-	if len(sorted) == 0 {
-		return
+// metric filters the copied samples to the window and computes percentiles.
+func (c ringCopy) metric(cutoff int64) metricView {
+	view := metricView{ewma: c.ewma, count: c.count}
+	values := make([]float64, 0, len(c.values))
+	for index, stamp := range c.stamps {
+		if stamp > cutoff {
+			values = append(values, c.values[index])
+		}
 	}
-	m.p50 = percentile(sorted, 0.50)
-	m.p95 = percentile(sorted, 0.95)
+	sort.Float64s(values)
+	view.windowSamples = len(values)
+	// A full ring whose oldest sample is still inside the window may have
+	// evicted older in-window samples.
+	view.truncated = c.full && c.oldest > cutoff
+	if len(values) > 0 {
+		view.p50 = percentile(values, 0.50)
+		view.p95 = percentile(values, 0.95)
+	}
+	return view
 }
 
 // percentile is the nearest-rank percentile of an ascending, non-empty slice.

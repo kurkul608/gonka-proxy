@@ -45,13 +45,22 @@ type provider struct {
 	config.Provider
 	id      providerID
 	chatURL string
+
+	// stats holds the route stats of each Upstream Model, resolved by
+	// attachStats before the snapshot is installed.
+	stats map[string]*routeStats
+	// legacyRoute (legacy Providers) and virtualRoutes (by Virtual Model)
+	// are the precomputed routes, stats pointer included.
+	legacyRoute   route
+	virtualRoutes map[string]route
 }
 
-// route is one candidate attempt: a Provider and the upstream model it uses
-// for the requested Virtual Model.
+// route is one candidate attempt: a Provider, the upstream model it uses for
+// the requested Virtual Model, and that pair's stats (nil before attachStats).
 type route struct {
 	provider *provider
 	upstream string
+	stats    *routeStats
 }
 
 // buildSnapshot validates cfg and prepares an immutable snapshot. previous
@@ -121,6 +130,7 @@ func buildSnapshot(cfg config.Config, logger Logger, previous *snapshot) (*snaps
 	sort.SliceStable(st.providers, func(i, j int) bool {
 		return st.providers[i].Priority > st.providers[j].Priority
 	})
+	st.attachStats(nil) // routes without stats until the snapshot is installed
 	sort.Slice(st.secrets, func(i, j int) bool {
 		return len(st.secrets[i]) > len(st.secrets[j])
 	})
@@ -150,11 +160,13 @@ func (st *snapshot) routes(virtual string) []route {
 		if candidate.Disabled {
 			continue
 		}
-		upstream, ok := candidate.UpstreamModel(virtual)
-		if !ok {
+		if candidate.Legacy() {
+			routes = append(routes, candidate.legacyRoute)
 			continue
 		}
-		routes = append(routes, route{provider: candidate, upstream: upstream})
+		if selected, ok := candidate.virtualRoutes[virtual]; ok {
+			routes = append(routes, selected)
+		}
 	}
 	return routes
 }
@@ -331,6 +343,22 @@ func (st *snapshot) statsKeys() []statsKey {
 	return keys
 }
 
-func (r route) statsKey() statsKey {
-	return statsKey{provider: r.provider.Name, baseURL: r.provider.BaseURL, upstream: r.upstream}
+// attachStats resolves every route's stats pointer from resolved (the
+// registry's entries for statsKeys). It runs once, before the snapshot is
+// installed; requests then record without any lookup.
+func (st *snapshot) attachStats(resolved map[statsKey]*routeStats) {
+	for _, configured := range st.providers {
+		configured.stats = make(map[string]*routeStats, len(configured.Models)+1)
+		for _, pair := range configured.upstreamRoutes() {
+			configured.stats[pair.upstream] = resolved[statsKey{provider: configured.Name, baseURL: configured.BaseURL, upstream: pair.upstream}]
+		}
+		if configured.Legacy() {
+			configured.legacyRoute = route{provider: configured, upstream: configured.ModelAlias, stats: configured.stats[configured.ModelAlias]}
+			continue
+		}
+		configured.virtualRoutes = make(map[string]route, len(configured.Models))
+		for virtual, upstream := range configured.Models {
+			configured.virtualRoutes[virtual] = route{provider: configured, upstream: upstream, stats: configured.stats[upstream]}
+		}
+	}
 }

@@ -36,7 +36,7 @@ func hasRouteStats(handler *proxy.Server, provider, upstream string) bool {
 	return false
 }
 
-// waitForRequests polls until the gate has seen want attempts: the proxy
+// waitForRequests polls until the route has seen want attempts: the proxy
 // records an attempt after the client may already have its answer.
 func waitForRequests(t *testing.T, handler *proxy.Server, provider, upstream string, want uint64) proxy.RouteStats {
 	t.Helper()
@@ -74,17 +74,18 @@ func TestStatsMeasureTTFBOfSlowFirstByte(t *testing.T) {
 	if entry.Total.Successes != 1 || entry.Total.Failures != 0 {
 		t.Fatalf("counts = %+v", entry.Total)
 	}
-	if entry.TTFBMs.Samples != 1 || entry.TTFBMs.EWMA == nil || entry.TTFBMs.P50 == nil || entry.TTFBMs.P95 == nil {
+	ttfb, tps := entry.TTFBMs.NonStream, entry.TPS.NonStream
+	if ttfb.Samples != 1 || ttfb.EWMA == nil || ttfb.P50 == nil || ttfb.P95 == nil || entry.TTFBMs.Stream.Samples != 0 {
 		t.Fatalf("ttfb = %+v", entry.TTFBMs)
 	}
-	if got := *entry.TTFBMs.EWMA; got < float64(delay/time.Millisecond) || got > 2000 {
+	if got := *ttfb.EWMA; got < float64(delay/time.Millisecond) || got > 2000 {
 		t.Fatalf("ttfb = %vms, want >= %v", got, delay)
 	}
-	if *entry.TTFBMs.P50 != *entry.TTFBMs.EWMA || *entry.TTFBMs.P95 != *entry.TTFBMs.EWMA {
-		t.Fatalf("one sample: p50/p95 must equal it: %+v", entry.TTFBMs)
+	if *ttfb.P50 != *ttfb.EWMA || *ttfb.P95 != *ttfb.EWMA {
+		t.Fatalf("one sample: p50/p95 must equal it: %+v", ttfb)
 	}
 	// 20 tokens in at least 150ms.
-	if entry.TPS.Samples != 1 || entry.TPS.EWMA == nil || *entry.TPS.EWMA <= 0 || *entry.TPS.EWMA > 20/delay.Seconds() {
+	if tps.Samples != 1 || tps.EWMA == nil || *tps.EWMA <= 0 || *tps.EWMA > 20/delay.Seconds() {
 		t.Fatalf("tokens/s = %+v", entry.TPS)
 	}
 	if entry.LastSuccessAt == nil || entry.LastFailureAt != nil || entry.LastErrorClass != nil {
@@ -102,7 +103,7 @@ func TestStatsSkipTokensWithoutUsage(t *testing.T) {
 	), proxy.Options{})
 	postChat(t, server, chatBody("any"), nil)
 	entry := waitForRequests(t, handler, "a", "a-model", 1)
-	if entry.Total.Successes != 1 || entry.TTFBMs.Samples != 1 || entry.TPS.Samples != 0 || entry.TPS.EWMA != nil {
+	if entry.Total.Successes != 1 || entry.TTFBMs.NonStream.Samples != 1 || entry.TPS.NonStream.Samples != 0 || entry.TPS.NonStream.EWMA != nil {
 		t.Fatalf("entry = %+v", entry)
 	}
 	if strings.Join(entry.VirtualModels, ",") != "*" {
@@ -140,7 +141,7 @@ func TestStatsClassifyServerErrorAndTimeout(t *testing.T) {
 	if brokenStats.Total.Failures != 1 || brokenStats.Total.FailuresByClass.Server != 1 || brokenStats.Window.FailuresByClass.Server != 1 {
 		t.Fatalf("broken = %+v", brokenStats.Total)
 	}
-	if brokenStats.LastErrorClass == nil || *brokenStats.LastErrorClass != "5xx" || brokenStats.LastFailureAt == nil || brokenStats.TTFBMs.Samples != 0 {
+	if brokenStats.LastErrorClass == nil || *brokenStats.LastErrorClass != "5xx" || brokenStats.LastFailureAt == nil || brokenStats.TTFBMs.NonStream.Samples != 0 {
 		t.Fatalf("broken last = %+v", brokenStats)
 	}
 	stalledStats := waitForRequests(t, handler, "stalled", "stalled-chat", 1)
@@ -177,7 +178,7 @@ func TestStatsClassifyConnectionErrorAndClientError(t *testing.T) {
 	}
 	rejected := waitForRequests(t, handler, "rejecting", "r-chat", 1)
 	if rejected.Total.ClientErrors != 1 || rejected.Total.Failures != 0 || rejected.Total.Successes != 0 || rejected.LastFailureAt != nil {
-		t.Fatalf("a passed-through 4xx is not a gate failure: %+v", rejected.Total)
+		t.Fatalf("a passed-through 400 is not a Provider failure: %+v", rejected.Total)
 	}
 }
 
@@ -250,17 +251,17 @@ func TestStatsCoverStreaming(t *testing.T) {
 		t.Fatalf("stream: %d %q", response.status, response.body)
 	}
 	entry := waitForRequests(t, handler, "s", "s-chat", 1)
-	if entry.Total.Successes != 1 || entry.TTFBMs.Samples != 1 || *entry.TTFBMs.EWMA < float64(delay/time.Millisecond) {
+	if entry.Total.Successes != 1 || entry.TTFBMs.Stream.Samples != 1 || *entry.TTFBMs.Stream.EWMA < float64(delay/time.Millisecond) || entry.TTFBMs.NonStream.Samples != 0 {
 		t.Fatalf("stream stats = %+v / %+v", entry.Total, entry.TTFBMs)
 	}
 	// 3 tokens over the ~60ms after the first chunk.
-	if entry.TPS.Samples != 1 || *entry.TPS.EWMA <= 0 || *entry.TPS.EWMA > 3/(40*time.Millisecond).Seconds() {
+	if entry.TPS.Stream.Samples != 1 || *entry.TPS.Stream.EWMA <= 0 || *entry.TPS.Stream.EWMA > 3/(40*time.Millisecond).Seconds() || entry.TPS.NonStream.Samples != 0 {
 		t.Fatalf("stream tokens/s = %+v", entry.TPS)
 	}
 
 	postChat(t, server, `{"model":"cut","stream":true,"messages":[]}`, nil)
 	cutStats := waitForRequests(t, handler, "cut", "cut-chat", 1)
-	if cutStats.Total.Failures != 1 || cutStats.Total.FailuresByClass.Connection != 1 || cutStats.TTFBMs.Samples != 0 {
+	if cutStats.Total.Failures != 1 || cutStats.Total.FailuresByClass.Connection != 1 || cutStats.TTFBMs.Stream.Samples != 0 {
 		t.Fatalf("cut stream = %+v", cutStats)
 	}
 }
@@ -312,7 +313,7 @@ func TestStatusJSONShape(t *testing.T) {
 		}
 		for _, block := range []string{"total", "window"} {
 			counts := entry[block].(map[string]any)
-			for _, key := range []string{"requests", "successes", "failures", "canceled", "client_errors"} {
+			for _, key := range []string{"requests", "successes", "failures", "canceled", "client_errors", "deadline"} {
 				if _, ok := counts[key].(float64); !ok {
 					t.Fatalf("%s.%s missing in %v", block, key, counts)
 				}
@@ -325,10 +326,19 @@ func TestStatusJSONShape(t *testing.T) {
 			}
 		}
 		for _, metric := range []string{"ttfb_ms", "tokens_per_second"} {
-			values := entry[metric].(map[string]any)
-			for _, key := range []string{"ewma", "p50", "p95", "samples", "window_samples"} {
-				if _, ok := values[key]; !ok {
-					t.Fatalf("%s.%s missing", metric, key)
+			byMode := entry[metric].(map[string]any)
+			if len(byMode) != 2 {
+				t.Fatalf("%s modes = %v", metric, byMode)
+			}
+			for _, mode := range []string{"stream", "non_stream"} {
+				values := byMode[mode].(map[string]any)
+				for _, key := range []string{"ewma", "p50", "p95", "samples", "window_samples"} {
+					if _, ok := values[key]; !ok {
+						t.Fatalf("%s.%s.%s missing", metric, mode, key)
+					}
+				}
+				if values["window_samples_truncated"] != false {
+					t.Fatalf("%s.%s.window_samples_truncated = %v", metric, mode, values["window_samples_truncated"])
 				}
 			}
 		}
@@ -343,11 +353,12 @@ func TestStatusJSONShape(t *testing.T) {
 	if total := first["total"].(map[string]any); total["requests"] != 1.0 || total["successes"] != 1.0 {
 		t.Fatalf("first total = %v", total)
 	}
-	if first["ttfb_ms"].(map[string]any)["ewma"] == nil {
-		t.Fatal("ttfb ewma is null after a success")
+	firstTTFB := first["ttfb_ms"].(map[string]any)
+	if firstTTFB["non_stream"].(map[string]any)["ewma"] == nil || firstTTFB["stream"].(map[string]any)["ewma"] != nil {
+		t.Fatalf("ttfb after one non-streaming success = %v", firstTTFB)
 	}
 	second := stats[1].(map[string]any)
-	if second["ttfb_ms"].(map[string]any)["ewma"] != nil || second["last_success_at"] != nil {
+	if second["ttfb_ms"].(map[string]any)["non_stream"].(map[string]any)["ewma"] != nil || second["last_success_at"] != nil {
 		t.Fatalf("unused gate must report nulls: %v", second)
 	}
 	if third := stats[2].(map[string]any); third["enabled"] != false {
@@ -380,7 +391,7 @@ func TestReloadKeepsStatsOfSurvivingGatesAndDropsRemovedOnes(t *testing.T) {
 		t.Fatal("stats of a removed model survived the reload")
 	}
 	kept := routeStats(t, handler, "a", "a-fast")
-	if kept.Total.Requests != 1 || kept.Since != since || kept.TTFBMs.Samples != 1 {
+	if kept.Total.Requests != 1 || kept.Since != since || kept.TTFBMs.NonStream.Samples != 1 {
 		t.Fatalf("stats of a kept gate were reset: %+v", kept)
 	}
 	if routeStats(t, handler, "b", "b-fast").Total.Requests != 0 {

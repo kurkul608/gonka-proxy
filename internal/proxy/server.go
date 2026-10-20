@@ -98,7 +98,7 @@ func NewWithOptions(cfg config.Config, options Options) (*Server, error) {
 		logger:      logger,
 		clientToken: strings.TrimSpace(options.ClientToken),
 	}
-	s.stats.sync(st.statsKeys(), time.Now())
+	st.attachStats(s.stats.ensure(st.statsKeys(), time.Now()))
 	s.state.Store(st)
 	return s, nil
 }
@@ -139,9 +139,13 @@ func (s *Server) Reload(cfg config.Config, beforeSwap func(config.Config) error)
 	if cfg.ListenAddress != current.cfg.ListenAddress {
 		s.logger.Printf("config reload - server.listen_address change takes effect after a restart")
 	}
+	// New route stats exist before the swap and removed ones are dropped
+	// after it, so no installed snapshot points at a missing entry.
+	keys := next.statsKeys()
+	next.attachStats(s.stats.ensure(keys, time.Now()))
 	s.state.Store(next)
 	s.cooldowns.retain(next.servesKey)
-	s.stats.sync(next.statsKeys(), time.Now())
+	s.stats.retain(keys)
 	if next.transport != current.transport {
 		current.transport.CloseIdleConnections()
 	}
@@ -229,6 +233,9 @@ type chatRequest struct {
 	clientEffort *config.ReasoningEffort
 	deadline     *routingDeadline
 	limit        time.Duration
+	// clientLimit: the limit came from X-Gonka-Max-Routing-Time (shorter
+	// than max_routing_time, or with none configured).
+	clientLimit bool
 }
 
 // MaxChatBodyBytes caps a chat completions request body. It leaves room for
@@ -307,6 +314,7 @@ func (s *Server) serveChat(st *snapshot, w http.ResponseWriter, r *http.Request)
 		clientEffort: clientEffort,
 		deadline:     deadline,
 		limit:        limit,
+		clientLimit:  limit > 0 && limit != st.maxRoutingTime,
 	})
 }
 
@@ -433,7 +441,14 @@ func (s *Server) attempt(w http.ResponseWriter, req *chatRequest, candidate rout
 			return true
 		}
 		if req.deadline.isExpired() {
-			s.recordAttempt(candidate, attemptRecord{outcome: outcomeFailure, class: statsClassTimeout})
+			// The Provider did not answer within the routing time. With the
+			// operator's max_routing_time that is the Provider's timeout; a
+			// client-chosen shorter limit is the client's deadline.
+			if req.clientLimit {
+				s.recordAttempt(candidate, attemptRecord{outcome: outcomeDeadline})
+			} else {
+				s.recordAttempt(candidate, attemptRecord{outcome: outcomeFailure, class: statsClassTimeout})
+			}
 			writeRoutingTimeout(st, w, req.limit)
 			return true
 		}
@@ -495,15 +510,12 @@ func (s *Server) attempt(w http.ResponseWriter, req *chatRequest, candidate rout
 			return false
 		}
 		if !req.deadline.commit() {
-			s.recordAttempt(candidate, attemptRecord{outcome: outcomeFailure, class: statsClassTimeout})
+			// The Provider answered; the deadline won the race.
+			s.recordAttempt(candidate, attemptRecord{outcome: outcomeDeadline})
 			writeRoutingTimeout(st, w, req.limit)
 			return true
 		}
-		if statusCode >= http.StatusBadRequest {
-			s.recordAttempt(candidate, attemptRecord{outcome: outcomeClientError})
-		} else {
-			s.recordAttempt(candidate, attemptRecord{outcome: outcomeSuccess})
-		}
+		s.recordAttempt(candidate, passThroughRecord(statusCode))
 
 		copyHeaders(w.Header(), upstreamResponse.Header)
 		setProviderHeaders(w.Header(), selected.Name, candidate.upstream)
@@ -514,7 +526,8 @@ func (s *Server) attempt(w http.ResponseWriter, req *chatRequest, candidate rout
 
 	defer upstreamResponse.Body.Close()
 	if !req.deadline.commit() {
-		s.recordAttempt(candidate, attemptRecord{outcome: outcomeFailure, class: statsClassTimeout})
+		// The Provider answered; the deadline won the race.
+		s.recordAttempt(candidate, attemptRecord{outcome: outcomeDeadline})
 		writeRoutingTimeout(st, w, req.limit)
 		return true
 	}
@@ -531,6 +544,7 @@ func (s *Server) attempt(w http.ResponseWriter, req *chatRequest, candidate rout
 	} else {
 		outcome = copyResponse(w, r, body)
 	}
+	outcome.streaming = streaming
 	if outcome.outcome == outcomeSuccess {
 		finished := time.Now()
 		if !body.firstByte.IsZero() {
@@ -563,7 +577,22 @@ func (s *Server) recordAttempt(candidate route, attempt attemptRecord) {
 	if attempt.at.IsZero() {
 		attempt.at = time.Now()
 	}
-	s.stats.record(candidate.statsKey(), attempt)
+	candidate.stats.record(attempt)
+}
+
+// passThroughRecord classifies a non-200 answer passed back to the client
+// unchanged. 401, 403 and 404 mean the proxy's API key is rejected or the
+// Upstream Model is missing: a Provider failure even when the failover
+// switches are off. Other 4xx (400, 422, ...) are the client's fault.
+func passThroughRecord(statusCode int) attemptRecord {
+	switch {
+	case statusCode == http.StatusUnauthorized, statusCode == http.StatusForbidden, statusCode == http.StatusNotFound:
+		return attemptRecord{outcome: outcomeFailure, class: statsClassClient}
+	case statusCode >= http.StatusBadRequest:
+		return attemptRecord{outcome: outcomeClientError}
+	default:
+		return attemptRecord{outcome: outcomeSuccess}
+	}
 }
 
 // statusClass is the stats failure class of an upstream HTTP status.
