@@ -429,6 +429,10 @@ func TestRunRejectsInvalidAdminEnvironment(t *testing.T) {
 		{"short admin token", map[string]string{envAdminToken: "short"}, "at least 16 characters"},
 		{"admin address without token", map[string]string{envAdminListenAddress: "127.0.0.1:0"}, envAdminToken + " is not"},
 		{"invalid persist flag", map[string]string{envAdminToken: "admin-token-0123456789", envAdminPersist: "sometimes"}, envAdminPersist},
+		{"invalid stats window", map[string]string{envStatsWindow: "soon"}, envStatsWindow},
+		{"too short stats window", map[string]string{envStatsWindow: "10ms"}, envStatsWindow},
+		{"invalid stats alpha", map[string]string{envStatsEWMAAlpha: "1.5"}, envStatsEWMAAlpha},
+		{"zero stats alpha", map[string]string{envStatsEWMAAlpha: "0"}, envStatsEWMAAlpha},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

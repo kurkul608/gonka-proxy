@@ -30,6 +30,8 @@ const (
 	envAdminToken         = "GONKA_PROXY_ADMIN_TOKEN"
 	envAdminListenAddress = "GONKA_PROXY_ADMIN_LISTEN_ADDRESS"
 	envAdminPersist       = "GONKA_PROXY_ADMIN_PERSIST"
+	envStatsWindow        = "GONKA_PROXY_STATS_WINDOW"
+	envStatsEWMAAlpha     = "GONKA_PROXY_STATS_EWMA_ALPHA"
 )
 
 func main() {
@@ -75,9 +77,14 @@ func runWith(ctx context.Context, configPath string, logger proxy.Logger, option
 	if err != nil {
 		return fmt.Errorf("load configuration: %w", err)
 	}
+	stats, err := parseStatsEnv(getenv)
+	if err != nil {
+		return err
+	}
 	handler, err := proxy.NewWithOptions(cfg, proxy.Options{
 		Logger:      logger,
 		ClientToken: getenv(envClientToken),
+		Stats:       stats,
 	})
 	if err != nil {
 		return fmt.Errorf("create proxy: %w", err)
@@ -263,6 +270,27 @@ func withAdmin(next, adminHandler http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// parseStatsEnv reads the optional stats window and EWMA alpha. Empty values
+// keep the defaults.
+func parseStatsEnv(getenv func(string) string) (proxy.StatsSettings, error) {
+	var settings proxy.StatsSettings
+	if value := strings.TrimSpace(getenv(envStatsWindow)); value != "" {
+		window, err := time.ParseDuration(value)
+		if err != nil || window < time.Second {
+			return settings, fmt.Errorf("%s must be a duration of at least 1s, such as 15m", envStatsWindow)
+		}
+		settings.Window = window
+	}
+	if value := strings.TrimSpace(getenv(envStatsEWMAAlpha)); value != "" {
+		alpha, err := strconv.ParseFloat(value, 64)
+		if err != nil || !(alpha > 0 && alpha <= 1) {
+			return settings, fmt.Errorf("%s must be a number greater than 0 and at most 1", envStatsEWMAAlpha)
+		}
+		settings.EWMAAlpha = alpha
+	}
+	return settings, nil
 }
 
 func parseBoolEnv(name, value string) (bool, error) {

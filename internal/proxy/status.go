@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"math"
 	"sort"
 	"time"
 )
@@ -12,6 +13,12 @@ type Status struct {
 	Providers        int              `json:"providers"`
 	EnabledProviders int              `json:"enabled_providers"`
 	ProviderStatuses []ProviderStatus `json:"provider_status"`
+
+	// StatsWindowSeconds is the sliding window of Stats[].Window and the
+	// percentiles; StatsEWMAAlpha weighs the newest sample in the EWMAs.
+	StatsWindowSeconds float64      `json:"stats_window_seconds"`
+	StatsEWMAAlpha     float64      `json:"stats_ewma_alpha"`
+	Stats              []RouteStats `json:"stats"`
 }
 
 // ProviderStatus is one Provider's state. CooldownUntil and LastFailure here
@@ -130,5 +137,148 @@ func (s *Server) Status() Status {
 		}
 		status.ProviderStatuses = append(status.ProviderStatuses, entry)
 	}
+	status.StatsWindowSeconds = s.stats.settings.Window.Seconds()
+	status.StatsEWMAAlpha = s.stats.settings.EWMAAlpha
+	status.Stats = s.routeStatsFor(st, now)
 	return status
+}
+
+// RouteStats is the traffic of one (Provider, Upstream Model) pair: every
+// upstream attempt the proxy made to that pair, failovers included.
+type RouteStats struct {
+	// Provider is the Provider name, the value of the X-Gonka-Provider header.
+	Provider string `json:"provider"`
+	// Upstream is the Upstream Model, the value of the X-Gonka-Model header.
+	Upstream string `json:"upstream"`
+	// VirtualModels are the Virtual Models this Provider routes to Upstream
+	// ("*" for a model_alias Provider), sorted.
+	VirtualModels []string `json:"virtual_models"`
+	Enabled       bool     `json:"enabled"`
+	// Since is when counting started for this pair: process start, or the
+	// reload that added it.
+	Since  string      `json:"since"`
+	Total  StatsCounts `json:"total"`
+	Window StatsCounts `json:"window"`
+	TTFBMs StatsMetric `json:"ttfb_ms"`
+	TPS    StatsMetric `json:"tokens_per_second"`
+	// LastSuccessAt, LastFailureAt and LastErrorClass are null until the
+	// first success or failure.
+	LastSuccessAt  *string `json:"last_success_at"`
+	LastFailureAt  *string `json:"last_failure_at"`
+	LastErrorClass *string `json:"last_error_class"`
+}
+
+// StatsCounts are attempt counters. Requests = Successes + Failures +
+// Canceled + ClientErrors.
+type StatsCounts struct {
+	Requests  uint64 `json:"requests"`
+	Successes uint64 `json:"successes"`
+	// Failures are failures of the Provider; FailuresByClass splits them.
+	Failures        uint64          `json:"failures"`
+	FailuresByClass FailuresByClass `json:"failures_by_class"`
+	// Canceled attempts ended because the client went away; they are not
+	// failures.
+	Canceled uint64 `json:"canceled"`
+	// ClientErrors are 4xx answers passed back to the client unchanged
+	// (Client Errors); they are neither successes nor failures.
+	ClientErrors uint64 `json:"client_errors"`
+}
+
+// FailuresByClass splits failures by class.
+type FailuresByClass struct {
+	Timeout    uint64 `json:"timeout"`
+	Server     uint64 `json:"5xx"`
+	Client     uint64 `json:"4xx"`
+	Connection uint64 `json:"connection"`
+}
+
+// StatsMetric summarizes one latency or throughput metric. EWMA covers every
+// sample since Since; P50 and P95 cover the samples inside the window. Each is
+// null without samples.
+type StatsMetric struct {
+	EWMA          *float64 `json:"ewma"`
+	P50           *float64 `json:"p50"`
+	P95           *float64 `json:"p95"`
+	Samples       uint64   `json:"samples"`
+	WindowSamples int      `json:"window_samples"`
+}
+
+func formatStatsTime(value time.Time) string {
+	return value.UTC().Format("2006-01-02T15:04:05.000Z07:00")
+}
+
+func optionalStatsTime(value time.Time) *string {
+	if value.IsZero() {
+		return nil
+	}
+	formatted := formatStatsTime(value)
+	return &formatted
+}
+
+func roundedPointer(value float64) *float64 {
+	rounded := math.Round(value*1000) / 1000
+	return &rounded
+}
+
+func (c statsCounters) counts() StatsCounts {
+	return StatsCounts{
+		Requests:  c.requests,
+		Successes: c.successes,
+		Failures:  c.failures,
+		FailuresByClass: FailuresByClass{
+			Timeout:    c.timeout,
+			Server:     c.server,
+			Client:     c.client,
+			Connection: c.connection,
+		},
+		Canceled:     c.canceled,
+		ClientErrors: c.clientErrors,
+	}
+}
+
+func (m metricView) metric() StatsMetric {
+	metric := StatsMetric{Samples: m.count, WindowSamples: m.windowSamples}
+	if m.count > 0 {
+		metric.EWMA = roundedPointer(m.ewma)
+	}
+	if m.windowSamples > 0 {
+		metric.P50 = roundedPointer(m.p50)
+		metric.P95 = roundedPointer(m.p95)
+	}
+	return metric
+}
+
+// routeStatsFor builds the stats array in routing order (Providers by
+// descending priority, then Upstream Models by name).
+func (s *Server) routeStatsFor(st *snapshot, now time.Time) []RouteStats {
+	views := s.stats.view(now)
+	result := make([]RouteStats, 0, len(views))
+	for _, configured := range st.providers {
+		for _, pair := range configured.upstreamRoutes() {
+			key := statsKey{provider: configured.Name, baseURL: configured.BaseURL, upstream: pair.upstream}
+			view, ok := views[key]
+			if !ok {
+				continue
+			}
+			entry := RouteStats{
+				Provider:      configured.Name,
+				Upstream:      pair.upstream,
+				VirtualModels: pair.virtuals,
+				Enabled:       !configured.Disabled,
+				Since:         formatStatsTime(view.since),
+				Total:         view.total.counts(),
+				Window:        view.window.counts(),
+				TTFBMs:        view.ttfb.metric(),
+				TPS:           view.tps.metric(),
+				LastSuccessAt: optionalStatsTime(view.lastSuccess),
+				LastFailureAt: optionalStatsTime(view.lastFailure),
+			}
+			if view.lastErrorClass != "" {
+				class := view.lastErrorClass
+				entry.LastErrorClass = &class
+			}
+			result = append(result, entry)
+		}
+	}
+	return result
 }

@@ -57,6 +57,8 @@ type Options struct {
 	Logger Logger
 	// ClientToken, when set, is the bearer token every /v1/* request must carry.
 	ClientToken string
+	// Stats tunes the per-route statistics in GET /admin/status.
+	Stats StatsSettings
 }
 
 // Server implements the public OpenAI-compatible HTTP endpoint. Its routing
@@ -64,6 +66,7 @@ type Options struct {
 type Server struct {
 	state       atomic.Pointer[snapshot]
 	cooldowns   *cooldownRegistry
+	stats       *statsRegistry
 	logger      Logger
 	clientToken string
 	reloadMu    sync.Mutex
@@ -91,9 +94,11 @@ func NewWithOptions(cfg config.Config, options Options) (*Server, error) {
 	}
 	s := &Server{
 		cooldowns:   newCooldownRegistry(),
+		stats:       newStatsRegistry(options.Stats),
 		logger:      logger,
 		clientToken: strings.TrimSpace(options.ClientToken),
 	}
+	s.stats.sync(st.statsKeys(), time.Now())
 	s.state.Store(st)
 	return s, nil
 }
@@ -108,7 +113,9 @@ type ReloadResult struct {
 // Reload validates cfg and atomically replaces the routing configuration.
 // Requests already in flight finish on the configuration they started with;
 // new requests use cfg. Cooldowns of Providers whose name, base URL and API
-// key are unchanged (and of upstream models they still serve) are kept.
+// key are unchanged (and of upstream models they still serve) are kept, as
+// are the stats of (Provider name, base URL, upstream model) pairs that are
+// still configured; the stats of removed pairs are dropped.
 //
 // beforeSwap, when not nil, runs after validation and before the swap (for
 // example to persist cfg); an error from it aborts the reload.
@@ -134,6 +141,7 @@ func (s *Server) Reload(cfg config.Config, beforeSwap func(config.Config) error)
 	}
 	s.state.Store(next)
 	s.cooldowns.retain(next.servesKey)
+	s.stats.sync(next.statsKeys(), time.Now())
 	if next.transport != current.transport {
 		current.transport.CloseIdleConnections()
 	}
@@ -416,21 +424,27 @@ func (s *Server) attempt(w http.ResponseWriter, req *chatRequest, candidate rout
 	upstreamRequest.Header.Del(MaxRoutingTimeHeader)
 	upstreamRequest.Header.Set("Authorization", "Bearer "+selected.APIKey)
 
+	started := time.Now()
 	upstreamResponse, err := st.client.Do(upstreamRequest)
 	if err != nil {
 		if r.Context().Err() != nil {
+			s.recordAttempt(candidate, attemptRecord{outcome: outcomeCanceled})
 			st.logCancellation("upstream")
 			return true
 		}
 		if req.deadline.isExpired() {
+			s.recordAttempt(candidate, attemptRecord{outcome: outcomeFailure, class: statsClassTimeout})
 			writeRoutingTimeout(st, w, req.limit)
 			return true
 		}
 		s.logProviderResponse(st, selected, 0, err.Error())
 		kind, category := failureKindNetwork, "network"
+		class := statsClassConnection
 		if isResponseHeaderTimeout(err) {
 			kind, category = failureKindTimeout, "response-header-timeout"
+			class = statsClassTimeout
 		}
+		s.recordAttempt(candidate, attemptRecord{outcome: outcomeFailure, class: class})
 		s.handleFailoverFailure(st, candidate, kind, category, 0)
 		return false
 	}
@@ -460,6 +474,7 @@ func (s *Server) attempt(w http.ResponseWriter, req *chatRequest, candidate rout
 			case http.StatusUnauthorized, http.StatusForbidden:
 				category = "auth"
 			}
+			s.recordAttempt(candidate, attemptRecord{outcome: outcomeFailure, class: statusClass(statusCode)})
 			s.handleFailoverFailure(st, candidate, failureKindStatus, category, statusCode)
 			return false
 		}
@@ -475,12 +490,19 @@ func (s *Server) attempt(w http.ResponseWriter, req *chatRequest, candidate rout
 		s.logProviderResponse(st, selected, statusCode, errorMessage)
 
 		if isReasoningEffortUnsupportedError(statusCode, errorMessage, responseBody) {
+			s.recordAttempt(candidate, attemptRecord{outcome: outcomeFailure, class: statsClassClient})
 			s.handleFailoverFailure(st, candidate, failureKindStatus, "reasoning-effort", statusCode)
 			return false
 		}
 		if !req.deadline.commit() {
+			s.recordAttempt(candidate, attemptRecord{outcome: outcomeFailure, class: statsClassTimeout})
 			writeRoutingTimeout(st, w, req.limit)
 			return true
+		}
+		if statusCode >= http.StatusBadRequest {
+			s.recordAttempt(candidate, attemptRecord{outcome: outcomeClientError})
+		} else {
+			s.recordAttempt(candidate, attemptRecord{outcome: outcomeSuccess})
 		}
 
 		copyHeaders(w.Header(), upstreamResponse.Header)
@@ -492,6 +514,7 @@ func (s *Server) attempt(w http.ResponseWriter, req *chatRequest, candidate rout
 
 	defer upstreamResponse.Body.Close()
 	if !req.deadline.commit() {
+		s.recordAttempt(candidate, attemptRecord{outcome: outcomeFailure, class: statsClassTimeout})
 		writeRoutingTimeout(st, w, req.limit)
 		return true
 	}
@@ -501,12 +524,62 @@ func (s *Server) attempt(w http.ResponseWriter, req *chatRequest, candidate rout
 	copyHeaders(w.Header(), upstreamResponse.Header)
 	setProviderHeaders(w.Header(), selected.Name, candidate.upstream)
 	w.WriteHeader(statusCode)
+	body := newMeteredBody(upstreamResponse.Body)
+	var outcome attemptRecord
 	if streaming {
-		s.forwardStreamingResponse(w, req, candidate, statusCode, upstreamResponse.Body)
-		return true
+		outcome = s.forwardStreamingResponse(w, req, candidate, statusCode, body)
+	} else {
+		outcome = copyResponse(w, r, body)
 	}
-	_, _ = io.Copy(w, upstreamResponse.Body)
+	if outcome.outcome == outcomeSuccess {
+		finished := time.Now()
+		if !body.firstByte.IsZero() {
+			outcome.ttfb = body.firstByte.Sub(started)
+		}
+		outcome.tokensPerSecond = body.tokensPerSecond(started, finished, streaming)
+	}
+	s.recordAttempt(candidate, outcome)
 	return true
+}
+
+// copyResponse forwards a non-streaming body and classifies how it ended.
+func copyResponse(w http.ResponseWriter, r *http.Request, body *meteredBody) attemptRecord {
+	_, copyErr := io.Copy(w, body)
+	switch {
+	case copyErr == nil:
+		return attemptRecord{outcome: outcomeSuccess}
+	case r.Context().Err() != nil:
+		return attemptRecord{outcome: outcomeCanceled}
+	case body.readErr != nil:
+		return attemptRecord{outcome: outcomeFailure, class: readErrorClass(body.readErr)}
+	default:
+		// The upstream body was fine; writing to the client failed.
+		return attemptRecord{outcome: outcomeCanceled}
+	}
+}
+
+// recordAttempt adds one finished upstream attempt to the route's stats.
+func (s *Server) recordAttempt(candidate route, attempt attemptRecord) {
+	if attempt.at.IsZero() {
+		attempt.at = time.Now()
+	}
+	s.stats.record(candidate.statsKey(), attempt)
+}
+
+// statusClass is the stats failure class of an upstream HTTP status.
+func statusClass(statusCode int) string {
+	if statusCode >= http.StatusInternalServerError {
+		return statsClassServer
+	}
+	return statsClassClient
+}
+
+// readErrorClass classifies an upstream body read failure.
+func readErrorClass(err error) string {
+	if isResponseHeaderTimeout(err) {
+		return statsClassTimeout
+	}
+	return statsClassConnection
 }
 
 func writeRoutingTimeout(st *snapshot, w http.ResponseWriter, limit time.Duration) {
@@ -611,7 +684,8 @@ func isSSEDoneLine(line []byte) bool {
 		bytes.Equal(line, []byte("data: "+sseDoneMarker))
 }
 
-func (s *Server) forwardStreamingResponse(w http.ResponseWriter, req *chatRequest, candidate route, statusCode int, body io.Reader) {
+// forwardStreamingResponse relays an SSE stream and classifies how it ended.
+func (s *Server) forwardStreamingResponse(w http.ResponseWriter, req *chatRequest, candidate route, statusCode int, body io.Reader) attemptRecord {
 	st := req.st
 	flusher, canFlush := w.(http.Flusher)
 	if canFlush {
@@ -633,7 +707,7 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, req *chatReques
 			if _, writeErr := w.Write(chunk); writeErr != nil {
 				recordStreamAbort(st, candidate.provider, statusCode, sentBytes, chunks, acc,
 					fmt.Sprintf("client-write error: %v", writeErr))
-				return
+				return attemptRecord{outcome: outcomeCanceled}
 			}
 			if canFlush {
 				flusher.Flush()
@@ -645,22 +719,22 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, req *chatReques
 		}
 		if errors.Is(readErr, io.EOF) {
 			if acc.sawDone() {
-				return
+				return attemptRecord{outcome: outcomeSuccess}
 			}
 			recordStreamAbort(st, candidate.provider, statusCode, sentBytes, chunks, acc,
 				"stream ended at EOF without [DONE] marker (broker SILENTLY cut the response)")
 			s.markCooldown(st, candidate, scopeModel, &failureRecord{kind: failureKindStream, category: "stream-incomplete", status: statusCode})
-			return
+			return attemptRecord{outcome: outcomeFailure, class: statsClassConnection}
 		}
 		if req.r.Context().Err() != nil {
 			recordStreamAbort(st, candidate.provider, statusCode, sentBytes, chunks, acc,
 				fmt.Sprintf("upstream read error: %v (request context canceled during stream)", readErr))
-			return
+			return attemptRecord{outcome: outcomeCanceled}
 		}
 		recordStreamAbort(st, candidate.provider, statusCode, sentBytes, chunks, acc,
 			fmt.Sprintf("upstream read error: %v", readErr))
 		s.handleFailoverFailure(st, candidate, failureKindStream, "stream", statusCode)
-		return
+		return attemptRecord{outcome: outcomeFailure, class: readErrorClass(readErr)}
 	}
 }
 

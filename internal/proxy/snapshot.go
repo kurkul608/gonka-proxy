@@ -293,3 +293,44 @@ func (st *snapshot) redactProviderSecrets(message string) string {
 func (st *snapshot) sanitizeLogMessage(message string) string {
 	return sanitizeErrorMessage(st.redactProviderSecrets(message))
 }
+
+// upstreamRoute is one (Provider, Upstream Model) pair and the Virtual Models routed
+// to it.
+type upstreamRoute struct {
+	upstream string
+	virtuals []string
+}
+
+// upstreamRoutes lists the Provider's Upstream Models by name, each with its sorted
+// Virtual Models ("*" for a legacy Provider).
+func (p *provider) upstreamRoutes() []upstreamRoute {
+	if p.Legacy() {
+		return []upstreamRoute{{upstream: p.ModelAlias, virtuals: []string{"*"}}}
+	}
+	byUpstream := make(map[string][]string, len(p.Models))
+	for virtual, upstream := range p.Models {
+		byUpstream[upstream] = append(byUpstream[upstream], virtual)
+	}
+	routes := make([]upstreamRoute, 0, len(byUpstream))
+	for upstream, virtuals := range byUpstream {
+		sort.Strings(virtuals)
+		routes = append(routes, upstreamRoute{upstream: upstream, virtuals: virtuals})
+	}
+	sort.Slice(routes, func(i, j int) bool { return routes[i].upstream < routes[j].upstream })
+	return routes
+}
+
+// statsKeys lists the stats keys of every configured Provider, enabled or not.
+func (st *snapshot) statsKeys() []statsKey {
+	var keys []statsKey
+	for _, configured := range st.providers {
+		for _, pair := range configured.upstreamRoutes() {
+			keys = append(keys, statsKey{provider: configured.Name, baseURL: configured.BaseURL, upstream: pair.upstream})
+		}
+	}
+	return keys
+}
+
+func (r route) statsKey() statsKey {
+	return statsKey{provider: r.provider.Name, baseURL: r.provider.BaseURL, upstream: r.upstream}
+}
